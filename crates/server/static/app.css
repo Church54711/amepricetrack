@@ -519,3 +519,18 @@ td.muted { color: var(--muted); }
 .checks { margin: 0 0 14px; padding-left: 20px; }
 .checks li { margin-bottom: 4px; }
 .checks li.warn { color: var(--warn); }
+
+/* ---------- the server's browser, used by hand ---------- */
+
+.remote-screen {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 160px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  cursor: crosshair;
+  margin-bottom: 8px;
+}
+#remote .actions { margin: 8px 0; }

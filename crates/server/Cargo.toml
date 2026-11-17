@@ -25,11 +25,12 @@ thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["formatting", "macros"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "sync", "fs", "net"] }
 tokio-tungstenite = "0.30.0"
-tower-http = { version = "0.7.1", features = ["trace", "limit", "compression-gzip"] }
+tower-http = { version = "0.7.1", features = ["trace", "limit", "compression-gzip", "decompression-gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
 [dev-dependencies]
+flate2 = "1"
 http-body-util = "0.1.5"
 tower = { version = "0.5.3", features = ["util"] }

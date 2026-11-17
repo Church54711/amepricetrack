@@ -48,7 +48,24 @@ import app.amepricetrack.App
 import app.amepricetrack.data.CollectEntry
 import app.amepricetrack.work.PageReader
 import app.amepricetrack.work.PhoneReport
+import app.amepricetrack.work.ReportWorker
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import kotlinx.coroutines.launch
+
+/** A setting with a switch, its name and what it means. */
+@Composable
+private fun SwitchRow(label: String, detail: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(label, fontWeight = FontWeight.Medium)
+            Muted(detail)
+        }
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
 
 /** The in-app browser, kept for as long as this screen is open. */
 @Composable
@@ -69,6 +86,12 @@ fun PhoneScreen(app: App, onBack: () -> Unit) {
     val results = remember { mutableStateMapOf<Long, String>() }
     val browser = rememberStoreBrowser()
     val scope = rememberCoroutineScope()
+    // The automatic-report choices, kept on this phone.
+    var autoReport by remember { mutableStateOf(app.session.autoReport) }
+    var wifiOnly by remember { mutableStateOf(app.session.reportOnWifiOnly) }
+    var whileCharging by remember { mutableStateOf(app.session.reportWhileCharging) }
+    var skipped by remember { mutableStateOf(app.session.reportSkippedStores) }
+    var visited by remember { mutableStateOf(app.session.visitedStores) }
 
     suspend fun load() {
         val result = app.attempt { app.api.collect() }
@@ -80,6 +103,8 @@ fun PhoneScreen(app: App, onBack: () -> Unit) {
     fun report(entries: List<CollectEntry>) {
         running = true
         results.clear()
+        // A price is text: pictures and video are left out while reading.
+        browser.lean = true
         scope.launch {
             for (entry in entries) {
                 current = entry.url
@@ -157,30 +182,90 @@ fun PhoneScreen(app: App, onBack: () -> Unit) {
                                 }
                             }
                             Muted("Keep this screen open while it works; each page takes a few seconds.")
+                        }
+
+                        Card {
+                            SectionTitle("Report by itself")
                             Muted(
-                                when (app.session.autoReport) {
-                                    "off" -> "Automatic reports are off. You can turn them on in Settings."
-                                    else -> app.session.lastReportSummary?.let { summary ->
-                                        "Last automatic report, ${ago(app.session.lastReportAt / 1000)}: $summary"
-                                    } ?: "The phone also reports by itself; see Settings."
-                                },
+                                "Your server reads prices itself, and that is the place for it. Turn this on only for what the server cannot do: " +
+                                    "a store that refuses it, or one you are signed in at on this phone only.",
                             )
+                            val choices = listOf("off" to "Off", "daily" to "Daily", "twice" to "Twice a day")
+                            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                                choices.forEachIndexed { index, (mode, label) ->
+                                    SegmentedButton(
+                                        selected = autoReport == mode,
+                                        onClick = {
+                                            autoReport = mode
+                                            app.session.autoReport = mode
+                                            ReportWorker.schedule(app, app.session)
+                                        },
+                                        shape = SegmentedButtonDefaults.itemShape(index, choices.size),
+                                        // No tick: the three labels need the room on a narrow phone.
+                                        icon = {},
+                                    ) { Text(label, maxLines = 1) }
+                                }
+                            }
+                            if (autoReport != "off") {
+                                SwitchRow("Only on Wi-Fi", "Where your home server usually is. Also keeps it off mobile data.", wifiOnly) {
+                                    wifiOnly = it
+                                    app.session.reportOnWifiOnly = it
+                                    ReportWorker.schedule(app, app.session)
+                                }
+                                SwitchRow("Only while charging", "Costs the battery nothing, but runs less often.", whileCharging) {
+                                    whileCharging = it
+                                    app.session.reportWhileCharging = it
+                                    ReportWorker.schedule(app, app.session)
+                                }
+                                Muted(
+                                    "It never runs on a low battery, reads at most ${PhoneReport.MAX_AUTOMATIC} pages a time without pictures or video, " +
+                                        "and skips anything read recently. Choose the stores below." +
+                                        (app.session.lastReportSummary?.let { " Last time, ${ago(app.session.lastReportAt / 1000)}: $it" } ?: ""),
+                                )
+                            }
                         }
 
                         Card {
                             SectionTitle("Stores")
-                            Muted("Open a store to sign in or choose your local store. After that, its prices here are treated as your own.")
+                            Muted(
+                                "Open a store to sign in or choose your local store on this phone. After that, its prices here are treated as your own." +
+                                    if (autoReport != "off") " The switch decides whether a store is part of the automatic reports." else "",
+                            )
+                            val plan = PhoneReport.Plan(visited, skipped, emptyMap(), 0)
                             entries.groupBy { it.storeName }.forEach { (store, products) ->
                                 val home = Uri.parse(products.first().url).let { "${it.scheme}://${it.host}/" }
-                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                val host = PhoneReport.hostOf(home)
+                                val part = PhoneReport.partOf(products, plan)
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Column(Modifier.weight(1f)) {
                                         Text(store, fontWeight = FontWeight.Medium)
-                                        Muted(if (products.size == 1) "1 product" else "${products.size} products")
+                                        val count = if (products.size == 1) "1 product" else "${products.size} products"
+                                        Muted(
+                                            count + when (part) {
+                                                PhoneReport.Part.ServerCannot -> ". Your server cannot read it."
+                                                PhoneReport.Part.OpenedHere -> ". You opened it on this phone."
+                                                PhoneReport.Part.NotNeeded -> ". Your server reads it; nothing for the phone to do."
+                                                PhoneReport.Part.TurnedOff -> ". Left out of automatic reports."
+                                            },
+                                        )
+                                    }
+                                    // Only stores the phone would report have something to switch off.
+                                    if (autoReport != "off" && part != PhoneReport.Part.NotNeeded) {
+                                        Switch(
+                                            checked = part != PhoneReport.Part.TurnedOff,
+                                            onCheckedChange = { on ->
+                                                skipped = if (on) skipped - host else skipped + host
+                                                app.session.reportSkippedStores = skipped
+                                            },
+                                        )
                                     }
                                     OutlinedButton(
                                         enabled = !running,
                                         onClick = {
-                                            app.session.visitedStores = app.session.visitedStores + PhoneReport.hostOf(home)
+                                            visited = visited + host
+                                            app.session.visitedStores = visited
+                                            // A person browsing wants the whole page, pictures included.
+                                            browser.lean = false
                                             browser.view.loadUrl(home)
                                             browsing = home
                                         },

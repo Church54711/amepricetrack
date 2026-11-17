@@ -11,10 +11,18 @@ data class SessionState(
     val username: String? = null,
     /** The theme chosen on the website: oled-gold, midnight, light or system. */
     val theme: String = "oled-gold",
-    /** A custom accent colour as #rrggbb, when one was chosen. */
+    /** The custom accent colour chosen on the website as #rrggbb, when there is one. */
     val accent: String? = null,
+    /** The theme chosen for this device alone, or null to look like the website. */
+    val deviceTheme: String? = null,
 ) {
     val signedIn: Boolean get() = serverUrl != null && token != null
+
+    /** The theme this device shows. */
+    val shownTheme: String get() = deviceTheme ?: theme
+
+    /** The accent this device shows. The website's own accent goes with the website's theme only. */
+    val shownAccent: String? get() = if (deviceTheme == null) accent else null
 }
 
 /**
@@ -32,6 +40,7 @@ class Session(context: Context) {
         username = prefs.getString("username", null),
         theme = prefs.getString("theme", null) ?: "oled-gold",
         accent = prefs.getString("accent", null),
+        deviceTheme = prefs.getString("device_theme", null),
     )
 
     fun signIn(serverUrl: String, token: String, username: String) {
@@ -51,6 +60,12 @@ class Session(context: Context) {
         _state.value = _state.value.copy(theme = theme, accent = accent)
     }
 
+    /** Chooses a theme for this device alone; null goes back to looking like the website. */
+    fun setDeviceTheme(theme: String?) {
+        if (theme == null) prefs.edit().remove("device_theme").apply() else prefs.edit().putString("device_theme", theme).apply()
+        _state.value = _state.value.copy(deviceTheme = theme)
+    }
+
     /** The newest alert already shown as a notification. */
     var lastAlertId: Long
         get() = prefs.getLong("last_alert", 0)
@@ -61,10 +76,51 @@ class Session(context: Context) {
         get() = prefs.getBoolean("alerts_started", false)
         set(value) = prefs.edit().putBoolean("alerts_started", value).apply()
 
-    /** How often the phone reports prices by itself: "off", "daily" or "twice" (a day). */
+    /**
+     * How often the phone reports prices by itself: "off", "daily" or "twice"
+     * (a day). Off unless the person turns it on: the server is the one that
+     * reads prices, and the phone only helps where the server cannot.
+     */
     var autoReport: String
-        get() = prefs.getString("auto_report", null) ?: "twice"
+        get() = prefs.getString("auto_report", null) ?: "off"
         set(value) = prefs.edit().putString("auto_report", value).apply()
+
+    /** Automatic reports only run on Wi-Fi, where the home server usually is. */
+    var reportOnWifiOnly: Boolean
+        get() = prefs.getBoolean("report_wifi_only", true)
+        set(value) = prefs.edit().putBoolean("report_wifi_only", value).apply()
+
+    /** Automatic reports only run while the phone is charging. */
+    var reportWhileCharging: Boolean
+        get() = prefs.getBoolean("report_charging", false)
+        set(value) = prefs.edit().putBoolean("report_charging", value).apply()
+
+    /** Stores (site names) left out of automatic reports. */
+    var reportSkippedStores: Set<String>
+        get() = prefs.getStringSet("report_skipped", emptySet()) ?: emptySet()
+        set(value) = prefs.edit().putStringSet("report_skipped", value).apply()
+
+    /** When this phone last reported each product, in seconds: product id -> time. */
+    var reportedAt: Map<Long, Long>
+        get() = prefs.getString("reported_at", null).orEmpty().split(',').mapNotNull { pair ->
+            val (id, at) = pair.split(':').takeIf { it.size == 2 } ?: return@mapNotNull null
+            (id.toLongOrNull() ?: return@mapNotNull null) to (at.toLongOrNull() ?: return@mapNotNull null)
+        }.toMap()
+        set(value) {
+            // Only the most recent few hundred are worth remembering.
+            val kept = value.entries.sortedByDescending { it.value }.take(300)
+            prefs.edit().putString("reported_at", kept.joinToString(",") { "${it.key}:${it.value}" }).apply()
+        }
+
+    /** How often the app asks the server for new alerts, in minutes; 0 for never. */
+    var alertEveryMinutes: Int
+        get() = prefs.getInt("alert_every", 30)
+        set(value) = prefs.edit().putInt("alert_every", value).apply()
+
+    /** How often the server checks a product at its usual pace, in minutes, as it last said. */
+    var checkIntervalMinutes: Int
+        get() = prefs.getInt("check_interval", 240)
+        set(value) = prefs.edit().putInt("check_interval", value).apply()
 
     /** When the phone last reported prices by itself, in milliseconds; 0 for never. */
     var lastReportAt: Long

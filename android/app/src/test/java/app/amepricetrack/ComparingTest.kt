@@ -9,6 +9,7 @@ import app.amepricetrack.data.parseFindAnswer
 import app.amepricetrack.data.parseFindStart
 import app.amepricetrack.data.parseProductDetail
 import app.amepricetrack.ui.matchNotes
+import app.amepricetrack.work.PageReader
 import app.amepricetrack.work.PhoneReport
 import app.amepricetrack.work.ReportWorker
 import kotlinx.coroutines.runBlocking
@@ -190,14 +191,48 @@ class ComparingTest {
             entry(3, "https://www.walmart.com/ip/777", needed = false),
             entry(4, "https://www.bestbuy.com/site/1.p?skuId=1", needed = true),
         )
+        val now = 1_000_000L
+        val sixHours = 6 * 3600L
+        fun plan(visited: Set<String> = emptySet(), skipped: Set<String> = emptySet(), reportedAt: Map<Long, Long> = emptyMap()) =
+            PhoneReport.Plan(visited, skipped, reportedAt, minGapSeconds = sixHours)
+        fun due(plan: PhoneReport.Plan, list: List<CollectEntry> = entries) = PhoneReport.automatic(list, plan, now).map { it.productId }
+
         // The ones the server needs come first; Walmart follows because it was opened in the app.
-        assertEquals(listOf(2L, 4L, 3L), PhoneReport.automatic(entries, setOf("walmart.com")).map { it.productId })
-        assertEquals(listOf(2L, 4L), PhoneReport.automatic(entries, emptySet()).map { it.productId })
+        assertEquals(listOf(2L, 4L, 3L), due(plan(visited = setOf("walmart.com"))))
+        // Amazon is read by the server and was never opened here: nothing for the phone to do.
+        assertEquals(listOf(2L, 4L), due(plan()))
+        // A store the person turned off is left out, even one the server cannot read.
+        assertEquals(listOf(4L, 3L), due(plan(visited = setOf("walmart.com"), skipped = setOf("staples.com"))))
+        // What this phone reported an hour ago is left for next time; older reports are due again.
+        assertEquals(listOf(4L), due(plan(reportedAt = mapOf(2L to now - 3600))))
+        assertEquals("the longest-waiting comes first", listOf(4L, 2L), due(plan(reportedAt = mapOf(2L to now - 7 * 3600))))
+        // A needed product the server managed to read lately can wait too.
+        val readLately = entries.map { if (it.productId == 4L) it.copy(lastSuccessAt = now - 600) else it }
+        assertEquals(listOf(2L), due(plan(), readLately))
+
         assertEquals("walmart.com", PhoneReport.hostOf("https://www.walmart.com/ip/777"))
         assertEquals("", PhoneReport.hostOf("not a link"))
-
         val many = (1L..60L).map { entry(it, "https://www.staples.com/x/product_$it", needed = true) }
-        assertEquals(PhoneReport.MAX_AUTOMATIC, PhoneReport.automatic(many, emptySet()).size)
+        assertEquals(PhoneReport.MAX_AUTOMATIC, due(plan(), many).size)
+
+        // What the Stores list says about each store.
+        fun part(id: Long, plan: PhoneReport.Plan) = PhoneReport.partOf(entries.filter { it.productId == id }, plan)
+        assertEquals(PhoneReport.Part.ServerCannot, part(2, plan()))
+        assertEquals(PhoneReport.Part.NotNeeded, part(3, plan()))
+        assertEquals(PhoneReport.Part.OpenedHere, part(3, plan(visited = setOf("walmart.com"))))
+        assertEquals(PhoneReport.Part.TurnedOff, part(2, plan(skipped = setOf("staples.com"))))
+    }
+
+    @Test
+    fun picturesFontsAndVideoAreLeftOutWhileReadingAPrice() {
+        assertTrue(PageReader.isHeavy("/images/chair.JPG"))
+        assertTrue(PageReader.isHeavy("/fonts/store.woff2"))
+        assertTrue(PageReader.isHeavy("/video/clip.mp4"))
+        // The page itself, its scripts and its data are what the price comes from.
+        assertFalse(PageReader.isHeavy("/chair/product_555"))
+        assertFalse(PageReader.isHeavy("/static/app.js"))
+        assertFalse(PageReader.isHeavy("/api/price.json"))
+        assertFalse(PageReader.isHeavy(null))
     }
 
     @Test

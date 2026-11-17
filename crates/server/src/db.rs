@@ -114,6 +114,18 @@ pub struct Watch {
     pub last_seen_in_stock: Option<bool>,
     pub last_alert_price_cents: Option<i64>,
     pub last_alert_at: Option<i64>,
+    /// How often this person wants the product checked, in minutes; None
+    /// for the server's usual pace.
+    pub check_minutes: Option<i64>,
+}
+
+/// The shortest and longest time between checks a person can ask for, in minutes.
+pub const CLOSEST_CHECK_MINUTES: i64 = 15;
+pub const LOOSEST_CHECK_MINUTES: i64 = 24 * 60;
+
+/// What a person typed or sent as "check every N minutes", kept only when it makes sense.
+pub fn close_check(minutes: Option<i64>) -> Option<i64> {
+    minutes.filter(|m| (CLOSEST_CHECK_MINUTES..=LOOSEST_CHECK_MINUTES).contains(m))
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -284,6 +296,44 @@ pub async fn due_products(db: &Db, limit: i64) -> Result<Vec<Product>> {
 
 pub async fn check_soon(db: &Db, product_id: i64) -> Result<()> {
     sqlx::query("UPDATE products SET next_check_at = 0 WHERE id = ?").bind(product_id).execute(db).await?;
+    Ok(())
+}
+
+/// Seconds between checks of one product: the server's usual pace, or
+/// sooner when someone asked for this product to be watched closely. The
+/// same product at other stores (a confirmed match) is checked as often,
+/// because a short sale there is what the person is waiting for.
+pub async fn check_interval(db: &Db, product_id: i64, usual: i64) -> Result<i64> {
+    let closest: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(w.check_minutes) FROM watches w
+         WHERE w.check_minutes IS NOT NULL
+           AND (w.product_id = ?1
+                OR w.product_id IN (SELECT c.source_product_id FROM comparisons c
+                                    WHERE c.product_id = ?1 AND c.user_id = w.user_id AND c.status = 'found'))",
+    )
+    .bind(product_id)
+    .fetch_one(db)
+    .await?;
+    Ok(match close_check(closest) {
+        Some(minutes) => usual.min(minutes * 60),
+        None => usual,
+    })
+}
+
+/// After someone asks for closer checks: the product, and its confirmed
+/// matches at other stores, are next checked within that time.
+pub async fn check_within(db: &Db, user_id: i64, product_id: i64, seconds: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE products SET next_check_at = MIN(next_check_at, ?1)
+         WHERE id = ?2
+            OR id IN (SELECT product_id FROM comparisons
+                      WHERE user_id = ?3 AND source_product_id = ?2 AND status = 'found' AND product_id IS NOT NULL)",
+    )
+    .bind(now() + seconds)
+    .bind(product_id)
+    .bind(user_id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -535,23 +585,32 @@ pub struct WatchEdit {
     pub notify_any_drop: bool,
     pub notify_back_in_stock: bool,
     pub note: Option<String>,
+    pub check_minutes: Option<i64>,
 }
 
 pub async fn update_watch(db: &Db, user_id: i64, product_id: i64, e: &WatchEdit) -> Result<bool> {
+    // A new target is announced afresh when it is already met; saving anything
+    // else (a note, how often to check) leaves what was announced alone.
     let done = sqlx::query(
-        "UPDATE watches SET target_price_cents = ?, drop_percent = ?, notify_any_drop = ?,
-            notify_back_in_stock = ?, note = ?, last_alert_price_cents = NULL
-         WHERE user_id = ? AND product_id = ?",
+        "UPDATE watches SET
+            last_alert_price_cents = CASE WHEN target_price_cents IS ?1 THEN last_alert_price_cents ELSE NULL END,
+            target_price_cents = ?1, drop_percent = ?2, notify_any_drop = ?3,
+            notify_back_in_stock = ?4, note = ?5, check_minutes = ?6
+         WHERE user_id = ?7 AND product_id = ?8",
     )
     .bind(e.target_price_cents)
     .bind(e.drop_percent)
     .bind(e.notify_any_drop)
     .bind(e.notify_back_in_stock)
     .bind(&e.note)
+    .bind(close_check(e.check_minutes))
     .bind(user_id)
     .bind(product_id)
     .execute(db)
     .await?;
+    if let Some(minutes) = close_check(e.check_minutes).filter(|_| done.rows_affected() > 0) {
+        check_within(db, user_id, product_id, minutes * 60).await?;
+    }
     Ok(done.rows_affected() > 0)
 }
 

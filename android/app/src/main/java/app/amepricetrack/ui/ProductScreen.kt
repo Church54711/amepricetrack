@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -59,6 +60,8 @@ import app.amepricetrack.data.PricePoint
 import app.amepricetrack.data.ProductDetail
 import app.amepricetrack.data.WatchSettings
 import app.amepricetrack.data.dollars
+import app.amepricetrack.data.paceChoices
+import app.amepricetrack.data.paceText
 import app.amepricetrack.data.parseDollars
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -187,7 +190,9 @@ fun ProductScreen(app: App, productId: Long, onBack: () -> Unit, onRemoved: () -
                         onSearchAgain = { act("Searching the other stores again.") { app.api.compareAgain(productId) } },
                     )
 
-                    AlertSettingsCard(item.watch) { settings -> act("Saved.") { app.api.updateWatch(productId, settings) } }
+                    AlertSettingsCard(item.watch, app.session.checkIntervalMinutes) { settings ->
+                        act("Saved.") { app.api.updateWatch(productId, settings) }
+                    }
 
                     OutlinedButton(onClick = { confirmRemove = true }, modifier = Modifier.fillMaxWidth()) {
                         Text("Stop tracking", color = LocalPalette.current.bad)
@@ -324,12 +329,13 @@ private fun OtherStoresCard(
 }
 
 @Composable
-private fun AlertSettingsCard(watch: WatchSettings, onSave: (WatchSettings) -> Unit) {
+private fun AlertSettingsCard(watch: WatchSettings, usualMinutes: Int, onSave: (WatchSettings) -> Unit) {
     var target by remember(watch) { mutableStateOf(watch.targetPriceCents?.let { "%.2f".format(it / 100.0) }.orEmpty()) }
     var drop by remember(watch) { mutableStateOf(watch.dropPercent?.let { if (it % 1.0 == 0.0) it.toInt().toString() else it.toString() }.orEmpty()) }
     var anyDrop by remember(watch) { mutableStateOf(watch.notifyAnyDrop) }
     var backInStock by remember(watch) { mutableStateOf(watch.notifyBackInStock) }
     var note by remember(watch) { mutableStateOf(watch.note.orEmpty()) }
+    var checkMinutes by remember(watch) { mutableStateOf(watch.checkMinutes) }
     var problem by remember { mutableStateOf<String?>(null) }
 
     Card {
@@ -364,6 +370,21 @@ private fun AlertSettingsCard(watch: WatchSettings, onSave: (WatchSettings) -> U
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        Text("Check the price", fontWeight = FontWeight.Medium)
+        val paces = listOf<Int?>(null) + paceChoices(usualMinutes, watch.checkMinutes)
+        paces.forEach { pace ->
+            Row(
+                Modifier.fillMaxWidth().clickable { checkMinutes = pace },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = checkMinutes == pace, onClick = { checkMinutes = pace })
+                Text(if (pace == null) "At the usual pace (about every ${paceText(usualMinutes)})" else "Every ${paceText(pace)}")
+            }
+        }
+        Muted(
+            "Closer checks catch a sale that only lasts a few hours. The same product at the other stores is checked as often. " +
+                "Stores notice frequent visits, so keep this for the few things you are waiting on.",
+        )
         problem?.let { Text(it, color = LocalPalette.current.bad) }
         Button(onClick = {
             val targetCents = if (target.isBlank()) null else parseDollars(target)
@@ -374,7 +395,7 @@ private fun AlertSettingsCard(watch: WatchSettings, onSave: (WatchSettings) -> U
                 else -> null
             }
             if (problem == null) {
-                onSave(WatchSettings(targetCents, dropPercent, anyDrop, backInStock, note.trim().ifEmpty { null }))
+                onSave(WatchSettings(targetCents, dropPercent, anyDrop, backInStock, note.trim().ifEmpty { null }, checkMinutes))
             }
         }) { Text("Save") }
     }

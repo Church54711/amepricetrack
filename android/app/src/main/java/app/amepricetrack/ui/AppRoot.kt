@@ -62,8 +62,6 @@ private const val TAB_ALERTS = "alerts"
 private const val TAB_ASSISTANT = "assistant"
 private const val TAB_SETTINGS = "settings"
 
-/** Opening the app this long after the last automatic price report starts one. */
-private const val CATCH_UP_AFTER_MS = 6 * 3600 * 1000L
 
 /** The whole app: the sign-in screen, or the four tabs with detail screens on top. */
 @Composable
@@ -98,13 +96,12 @@ private fun SignedIn(app: App, incoming: Incoming?, onIncomingHandled: () -> Uni
     LaunchedEffect(Unit) {
         app.attempt { app.api.me() }.onSuccess {
             app.session.setLook(it.theme, it.accent)
+            app.session.checkIntervalMinutes = it.checkIntervalMinutes
             unread = it.unreadAlerts
         }
-        AlertWorker.schedule(app)
-        // Prices the phone reports by itself; catch up now if it has been a while.
-        ReportWorker.schedule(app, app.session.autoReport)
-        val sinceLast = System.currentTimeMillis() - app.session.lastReportAt
-        if (app.session.autoReport != "off" && sinceLast > CATCH_UP_AFTER_MS) ReportWorker.runSoon(app)
+        AlertWorker.schedule(app, app.session.alertEveryMinutes)
+        // Only does anything when the person turned automatic reports on.
+        ReportWorker.schedule(app, app.session)
     }
 
     LaunchedEffect(incoming) {

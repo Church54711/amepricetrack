@@ -143,18 +143,45 @@ pub async fn notify(
         (Some(base), Some(id)) => format!("{base}/products/{id}"),
         _ => store_link.to_string(),
     };
+    // For someone who uses the phone app, the pushed alert gets a button that opens the product there.
+    let app_link = match product_id {
+        Some(id) if !settings.ntfy_url.is_empty() && uses_phone_app(&app.db, user_id).await? => Some(app_link(id)),
+        _ => None,
+    };
     let (http, title, body) = (app.http.clone(), title.to_string(), body.to_string());
     // Pushing is best effort and must not hold up the price checker.
     tokio::spawn(async move {
-        if let Err(e) = push(&http, &settings.ntfy_url, &settings.webhook_url, &title, &body, &link).await {
+        if let Err(e) = push(&http, &settings.ntfy_url, &settings.webhook_url, &title, &body, &link, app_link.as_deref()).await {
             tracing::warn!("could not push alert: {e:#}");
         }
     });
     Ok(())
 }
 
+/// The address that opens a product in the phone app.
+pub fn app_link(product_id: i64) -> String {
+    format!("amepricetrack://products/{product_id}")
+}
+
+/// True when this person has a phone (or anything else) signed in through the API.
+async fn uses_phone_app(db: &db::Db, user_id: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sessions WHERE user_id = ? AND kind = 'api')")
+        .bind(user_id)
+        .fetch_one(db)
+        .await?)
+}
+
 /// Sends one alert to ntfy and/or a webhook. Empty addresses are skipped.
-pub async fn push(http: &reqwest::Client, ntfy_url: &str, webhook_url: &str, title: &str, body: &str, link: &str) -> Result<()> {
+/// `app_link` adds a button to the ntfy notification that opens the phone app.
+pub async fn push(
+    http: &reqwest::Client,
+    ntfy_url: &str,
+    webhook_url: &str,
+    title: &str,
+    body: &str,
+    link: &str,
+    app_link: Option<&str>,
+) -> Result<()> {
     let mut problems = Vec::new();
     if !ntfy_url.is_empty() {
         // ntfy headers must be plain ASCII; the arrow in price drops is not.
@@ -163,6 +190,9 @@ pub async fn push(http: &reqwest::Client, ntfy_url: &str, webhook_url: &str, tit
         // An alert about the server itself may have nowhere to link to.
         if !link.is_empty() {
             request = request.header("Click", link);
+        }
+        if let Some(app_link) = app_link {
+            request = request.header("Actions", format!("view, Open in app, {app_link}, clear=true"));
         }
         let sent = request.body(body.to_string()).send().await.and_then(|r| r.error_for_status());
         if let Err(e) = sent {
@@ -240,6 +270,7 @@ mod tests {
             last_seen_in_stock: None,
             last_alert_price_cents: None,
             last_alert_at: None,
+            check_minutes: None,
         }
     }
 
@@ -302,6 +333,57 @@ mod tests {
         assert_eq!(decide(&w, &p, &pricing::view(&p, None, &[])), None);
         let alert = decide(&w, &p, &pricing::view(&p, None, &[rule])).unwrap();
         assert_eq!(alert.headline, "Hit your target: now $90.00 (target $92.00)");
+    }
+
+    /// Accepts one request on this machine, answers "OK", and hands back what was sent.
+    async fn one_request() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}/made-up-topic", listener.local_addr().unwrap());
+        let received = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buffer = [0u8; 4096];
+            // The headers and the short body arrive within the first reads.
+            while !String::from_utf8_lossy(&seen).contains("Lowest price recorded") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buffer[..n]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").await.unwrap();
+            String::from_utf8_lossy(&seen).to_ascii_lowercase()
+        });
+        (address, received)
+    }
+
+    #[tokio::test]
+    async fn a_pushed_alert_can_open_the_phone_app() {
+        let http = reqwest::Client::new();
+        let (topic, received) = one_request().await;
+        let body = "Chair\nLowest price recorded so far.";
+        push(
+            &http,
+            &topic,
+            "",
+            "Staples: Price drop: $100.00 \u{2192} $90.00",
+            body,
+            "http://server.example/products/12",
+            Some(&app_link(12)),
+        )
+        .await
+        .unwrap();
+        let sent = received.await.unwrap();
+        assert!(sent.contains("title: staples: price drop: $100.00 -> $90.00"), "{sent}");
+        assert!(sent.contains("click: http://server.example/products/12"), "{sent}");
+        assert!(sent.contains("actions: view, open in app, amepricetrack://products/12, clear=true"), "{sent}");
+
+        // Without the app in use there is no such button.
+        let (topic, received) = one_request().await;
+        push(&http, &topic, "", "Staples: Back in stock", body, "", None).await.unwrap();
+        let sent = received.await.unwrap();
+        assert!(!sent.contains("actions:") && !sent.contains("click:"), "{sent}");
     }
 
     #[test]

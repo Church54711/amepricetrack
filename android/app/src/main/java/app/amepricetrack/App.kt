@@ -18,8 +18,8 @@ class App : Application() {
         api = ApiClient(serverUrl = { session.state.value.serverUrl }, token = { session.state.value.token })
         AlertWorker.createChannel(this)
         if (session.state.value.signedIn) {
-            AlertWorker.schedule(this)
-            ReportWorker.schedule(this, session.autoReport)
+            AlertWorker.schedule(this, session.alertEveryMinutes)
+            ReportWorker.schedule(this, session)
         }
     }
 }

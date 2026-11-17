@@ -39,6 +39,8 @@ data class WatchSettings(
     val notifyAnyDrop: Boolean,
     val notifyBackInStock: Boolean,
     val note: String?,
+    /** Check this product every so many minutes; null for the server's usual pace. */
+    val checkMinutes: Int? = null,
 )
 
 data class Price(
@@ -140,6 +142,16 @@ data class Me(
     val isAdmin: Boolean,
     val unreadAlerts: Int,
     val serverVersion: String,
+    /** How often the server checks a product nobody asked to have watched closely. */
+    val checkIntervalMinutes: Int = 240,
+)
+
+/** Where the server pushes this person's alerts. */
+data class PushSettings(
+    /** The ntfy topic address, or "" when alerts are not pushed through ntfy. */
+    val ntfyUrl: String,
+    /** True when a webhook is set up on the website as well. */
+    val webhook: Boolean,
 )
 
 /** A product page the phone can load and report back. */
@@ -216,6 +228,7 @@ fun parseWatchItem(o: JSONObject): WatchItem {
             notifyAnyDrop = watch.optBoolean("notify_any_drop", true),
             notifyBackInStock = watch.optBoolean("notify_back_in_stock", false),
             note = watch.text("note"),
+            checkMinutes = watch.long("check_minutes")?.toInt(),
         ),
         price = Price(
             publicCents = price.long("public_cents"),
@@ -291,7 +304,10 @@ fun parseMe(o: JSONObject) = Me(
     isAdmin = o.optBoolean("is_admin", false),
     unreadAlerts = o.optInt("unread_alerts", 0),
     serverVersion = o.optString("server_version"),
+    checkIntervalMinutes = o.optInt("check_interval_minutes", 240),
 )
+
+fun parsePushSettings(o: JSONObject) = PushSettings(ntfyUrl = o.optString("ntfy_url"), webhook = o.optBoolean("webhook", false))
 
 fun parseCollect(o: JSONObject): List<CollectEntry> {
     fun entries(key: String, needed: Boolean) = o.optJSONArray(key).mapObjects {
@@ -323,6 +339,49 @@ fun parseFindAnswer(o: JSONObject) = FindAnswer(
 )
 
 // ------------------------------------------------------------------ small helpers
+
+/** How long between checks, in words that follow "every": 30 -> "30 minutes", 60 -> "hour", 240 -> "4 hours". */
+fun paceText(minutes: Int): String = when {
+    minutes == 60 -> "hour"
+    minutes >= 120 && minutes % 60 == 0 -> "${minutes / 60} hours"
+    else -> "$minutes minutes"
+}
+
+/**
+ * The closer paces a person can choose for one product, in minutes: the ones
+ * shorter than the server's usual pace, and whatever is saved already.
+ */
+fun paceChoices(usualMinutes: Int, saved: Int?): List<Int> =
+    (listOf(30, 60, 120).filter { it < usualMinutes } + listOfNotNull(saved)).distinct().sorted()
+
+/** A new ntfy topic address on the public ntfy server, with a name nobody could guess. */
+fun newNtfyAddress(random: java.util.Random = java.security.SecureRandom()): String {
+    val letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+    val name = (1..24).map { letters[random.nextInt(letters.length)] }.joinToString("")
+    return "https://ntfy.sh/apt-$name"
+}
+
+/**
+ * The link that opens a topic in the ntfy app and subscribes to it:
+ * "https://ntfy.sh/my-topic" -> "ntfy://ntfy.sh/my-topic". A server reached
+ * without HTTPS is marked as such. Null when the address is not a topic address.
+ */
+fun ntfyAppLink(address: String): String? {
+    val uri = try {
+        java.net.URI(address.trim())
+    } catch (e: Exception) {
+        return null
+    }
+    val scheme = uri.scheme?.lowercase()
+    val server = uri.rawAuthority
+    val topic = uri.rawPath.orEmpty().trim('/')
+    if (scheme !in setOf("http", "https") || server.isNullOrEmpty() || topic.isEmpty() || topic.contains('/')) return null
+    return "ntfy://$server/$topic" + if (scheme == "http") "?secure=false" else ""
+}
+
+/** The product a link such as "amepricetrack://products/12" points at, when it is one. */
+fun productIdFromAppLink(link: String?): Long? =
+    link?.let { Regex("""^amepricetrack://products/(\d{1,18})/?$""").matchEntire(it.trim()) }?.groupValues?.get(1)?.toLongOrNull()
 
 /**
  * A browser hands back the result of a script as JSON text: a page's HTML

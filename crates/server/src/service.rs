@@ -139,7 +139,8 @@ pub async fn ingest(app: &App, user_id: i64, url: &str, html: &str, signed_in: b
     let audience = if signed_in && public_is_fresh && differs { Audience::Member(user_id) } else { Audience::Public };
 
     // A public reading from the phone counts as a check, so the server waits a full interval.
-    let next = (audience == Audience::Public).then(|| app.cfg.check_interval.as_secs() as i64);
+    let interval = db::check_interval(&app.db, product.id, app.cfg.check_interval.as_secs() as i64).await?;
+    let next = (audience == Audience::Public).then_some(interval);
     let changed = db::record_observation(&app.db, product.id, &obs, "device", audience, None, next).await?;
     if changed {
         alerts::evaluate(app, product.id).await?;
@@ -174,6 +175,56 @@ pub async fn rebaseline(app: &App, user_id: i64, retailer: &str) -> Result<(), P
         alerts::evaluate(app, id).await?;
     }
     Ok(())
+}
+
+// ------------------------------------------------------------ pushed alerts
+
+/// Checks a web address a person typed for pushing alerts to. Empty stays empty.
+pub fn web_address(text: &str, what: &str) -> Result<String, Problem> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    match url::Url::parse(text) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => Ok(text.to_string()),
+        _ => Err(user_problem(format!("The {what} address must start with http:// or https://"))),
+    }
+}
+
+/// Sets (or, with an empty address, clears) the ntfy topic a person's alerts are pushed to.
+pub async fn set_ntfy(app: &App, user_id: i64, address: &str) -> Result<String, Problem> {
+    let ntfy = web_address(address, "ntfy")?;
+    if !ntfy.is_empty() {
+        // A topic address is the server plus one name: https://ntfy.sh/my-topic
+        let topic = url::Url::parse(&ntfy).ok().map(|u| u.path().trim_matches('/').to_string()).unwrap_or_default();
+        if topic.is_empty() || topic.contains('/') {
+            return Err(user_problem(
+                "The ntfy address needs a topic name after the server, such as https://ntfy.sh/my-topic-name",
+            ));
+        }
+    }
+    sqlx::query("UPDATE user_settings SET ntfy_url = ? WHERE user_id = ?").bind(&ntfy).bind(user_id).execute(&app.db).await?;
+    Ok(ntfy)
+}
+
+/// Pushes a test alert to wherever this person's alerts go.
+pub async fn send_test_push(app: &App, user_id: i64) -> Result<(), Problem> {
+    let settings = db::settings(&app.db, user_id).await?;
+    if settings.ntfy_url.is_empty() && settings.webhook_url.is_empty() {
+        return Err(user_problem("Add an ntfy or webhook address first, then send a test."));
+    }
+    let link = app.cfg.public_url.clone().unwrap_or_default();
+    alerts::push(
+        &app.http,
+        &settings.ntfy_url,
+        &settings.webhook_url,
+        "AmePriceTrack test alert",
+        "If you can read this, alerts will reach you here.",
+        &link,
+        None,
+    )
+    .await
+    .map_err(|e| user_problem(format!("The test could not be delivered: {e}")))
 }
 
 // --------------------------------------------------------------- assistant

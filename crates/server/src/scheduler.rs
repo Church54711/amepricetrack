@@ -35,6 +35,10 @@ pub async fn run(app: App) {
             if let Err(e) = crate::health::check(&app).await {
                 tracing::warn!("could not check the stores' health: {e:#}");
             }
+            // Once a day, a copy of the database.
+            if let Err(e) = crate::backup::daily(&app).await {
+                tracing::warn!("could not look after the backups: {e:#}");
+            }
         }
 
         // Sleep until something is due, or until someone adds a product or presses "check now".
@@ -56,10 +60,18 @@ pub fn retry_delay(error: &FetchError, fails: i64, interval: i64) -> i64 {
 }
 
 pub async fn check_one(app: &App, product: &Product) {
-    let interval = app.cfg.check_interval.as_secs() as i64;
+    let usual = app.cfg.check_interval.as_secs() as i64;
+    // Sooner for a product someone asked to have watched closely.
+    let interval = db::check_interval(&app.db, product.id, usual).await.unwrap_or(usual);
     let fetched = app.fetcher.fetch(&product.retailer, &product.retailer_sku, &product.url, product.remembered_mode()).await;
     match fetched {
         Ok(found) => {
+            // The page also shows whether a sign-in made in the server's browser still holds.
+            if let Some(html) = found.html.as_deref() {
+                if let Err(e) = crate::stores::note_reading(app, &product.retailer, found.mode, html).await {
+                    tracing::warn!(store = %product.retailer, "could not check the store's sign-in: {e}");
+                }
+            }
             // Spread checks out a little so they do not all land on the same minute.
             let next = (interval as f64 * rand::random_range(0.9..1.1)) as i64;
             let recorded =

@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.amepricetrack.data.productIdFromAppLink
 import app.amepricetrack.ui.AppRoot
 import app.amepricetrack.ui.AppTheme
 import app.amepricetrack.ui.paletteFor
@@ -22,7 +23,7 @@ sealed interface Incoming {
     /** A product link (or the text a store app shares) to start tracking. */
     data class SharedText(val text: String) : Incoming
 
-    /** A notification was tapped. */
+    /** A notification was tapped, or "Open in app" on a pushed alert. */
     data class OpenProduct(val id: Long) : Incoming
 }
 
@@ -35,14 +36,14 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) incoming = read(intent)
         setContent {
             val session by app.session.state.collectAsStateWithLifecycle()
-            val dark = paletteFor(session.theme, session.accent, isSystemInDarkTheme()).dark
+            val dark = paletteFor(session.shownTheme, session.shownAccent, isSystemInDarkTheme()).dark
             // Status and navigation bar icons that can be seen on the theme's background.
             LaunchedEffect(dark) {
                 val transparent = android.graphics.Color.TRANSPARENT
                 val style = if (dark) SystemBarStyle.dark(transparent) else SystemBarStyle.light(transparent, transparent)
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
             }
-            AppTheme(session.theme, session.accent) {
+            AppTheme(session.shownTheme, session.shownAccent) {
                 AppRoot(app = app, session = session, incoming = incoming, onIncomingHandled = { incoming = null })
             }
         }
@@ -58,6 +59,10 @@ class MainActivity : ComponentActivity() {
         if (intent.action == Intent.ACTION_SEND && intent.type == "text/plain") {
             val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
             return if (text.isEmpty()) null else Incoming.SharedText(text)
+        }
+        // "Open in app" on an alert the server pushed through ntfy.
+        if (intent.action == Intent.ACTION_VIEW) {
+            return productIdFromAppLink(intent.dataString)?.let { Incoming.OpenProduct(it) }
         }
         val productId = intent.getLongExtra(AlertWorker.EXTRA_PRODUCT_ID, -1L)
         return if (productId > 0) Incoming.OpenProduct(productId) else null

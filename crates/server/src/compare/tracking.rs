@@ -433,7 +433,8 @@ async fn search_one(app: &App, row: &Comparison) -> Result<()> {
                 url: found.candidate.url.clone(),
             };
             let product_id = db::upsert_product(&app.db, &reference).await?;
-            let interval = app.cfg.check_interval.as_secs() as i64;
+            let usual = app.cfg.check_interval.as_secs() as i64;
+            let interval = db::check_interval(&app.db, product_id, usual).await?;
             db::record_observation(&app.db, product_id, &found.obs, "server", Audience::Public, Some(found.mode), Some(interval))
                 .await?;
             debug_assert!(found.score >= POSSIBLE);

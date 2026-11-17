@@ -26,8 +26,10 @@ import app.amepricetrack.data.ApiException
 import java.util.concurrent.TimeUnit
 
 /**
- * Asks the server for new alerts about every fifteen minutes (the shortest
- * interval Android allows for background work) and shows them as notifications.
+ * Asks the server for new alerts every so often (half an hour unless the
+ * person chose otherwise) and shows them as notifications. One small request
+ * each time; when the server cannot be reached it simply waits for the next
+ * turn rather than trying again and again.
  */
 class AlertWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
@@ -38,8 +40,8 @@ class AlertWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
             check(app)
             Result.success()
         } catch (e: ApiException) {
-            // Signed out elsewhere: nothing to retry until the person signs in again.
-            if (e.signedOut) Result.success() else Result.retry()
+            // Away from home, or signed out elsewhere: the next turn is soon enough.
+            Result.success()
         }
     }
 
@@ -55,10 +57,18 @@ class AlertWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
             context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
 
-        fun schedule(context: Context) {
+        /** Checks every `minutes` (15 is the shortest Android allows); 0 stops checking. */
+        fun schedule(context: Context, minutes: Int) {
+            if (minutes <= 0) {
+                cancel(context)
+                return
+            }
             val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
-            val request = PeriodicWorkRequestBuilder<AlertWorker>(15, TimeUnit.MINUTES).setConstraints(constraints).build()
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, request)
+            val request = PeriodicWorkRequestBuilder<AlertWorker>(maxOf(minutes, 15).toLong(), TimeUnit.MINUTES)
+                .setConstraints(constraints)
+                .build()
+            // UPDATE keeps the running schedule and only changes how often.
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
         }
 
         fun cancel(context: Context) {

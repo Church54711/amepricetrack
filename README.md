@@ -41,6 +41,10 @@ checking. Data lives in a single SQLite file.
   listings side by side with what to check, ready to show at the register.
 - **Tells you when a store stops working.** If nothing at a store could be
   read for two days you get an alert, and another when it reads again.
+- **Watches closely when you ask.** A product you are waiting on can be
+  checked every 30 minutes, hour or two hours instead of the usual four.
+- **Backs itself up.** A copy of the database is written once a day and the
+  newest 14 are kept.
 - **AI assistant** that sees your watchlist, and helps with matching: it
   picks the right search results and judges listings that no barcode
   settles. Works with Claude, OpenAI, DeepSeek, Gemini, OpenRouter, Ollama,
@@ -63,17 +67,25 @@ There is a companion Android app in `android/` (see "Android app" below).
 | Staples, Best Buy, Kohl's, Harbor Freight | A real Chrome window. These stores answer plain requests and headless browsers with "access denied", so the server runs an ordinary Chrome on a virtual screen (Xvfb) and reads the finished page. |
 | Other shops, and stores you add | A plain request first, then Chrome if that is refused. |
 
-**Best Buy on Linux is a known gap.** In testing (November 2026, Ubuntu 24.04
-under WSL), Best Buy served Chrome on Windows normally but dropped every
-connection from Chrome on Ubuntu (`ERR_HTTP2_PROTOCOL_ERROR`), whatever the
-browser called itself. On a Linux server, expect Best Buy products to show
-"Could not read price" until a device reports them through the phone API.
-Staples, Kohl's, Harbor Freight and Walmart were read correctly on Ubuntu in
-the same test; Target and Amazon use plain requests and were only run from
-Windows.
+**Best Buy on Linux comes and goes.** Tested on Ubuntu 24.04 under WSL in
+November 2026: on the 16th, after a day of heavy testing from the same
+connection, Best Buy dropped every connection from Chrome on Ubuntu
+(`ERR_HTTP2_PROTOCOL_ERROR`) while serving Chrome on Windows normally; on
+the 17th the same Ubuntu setup read Best Buy product pages and its search
+without trouble. So a refusal there looks like a temporary block of a busy
+address, not a rule against Linux. If it happens, the Stores page shows it
+and you get the "store stopped working" alert after two days; it has cleared
+by itself so far. Staples, Kohl's, Harbor Freight and Walmart were read
+correctly on Ubuntu in both tests. (Best Buy also has an official product
+data service, but its terms forbid keeping what it returns for more than 72
+hours, which a price history does, so the server does not use it.)
 
 Each product is checked about every four hours, with at least eight seconds
-between two requests to the same store. A server at home works best; stores
+between two requests to the same store. One you are waiting on can be
+checked more often: on its page, under "Check the price", choose every 30
+minutes, hour or two hours. The same product at the other stores is then
+checked as often. Stores notice frequent visits, so keep this to a few
+products. A server at home works best; stores
 are stricter with data-centre addresses. Automated reading is against most
 stores' terms of use, so keep it to personal use at this gentle pace.
 
@@ -199,9 +211,40 @@ Walmart also prices per store, but it chooses the store itself from the
 internet connection the request comes from, and (as tested in November 2026)
 ignores a store named by a plain request. The Stores page shows which store
 Walmart used for the server's readings. On a server at home that is normally
-a store near you. If it is not your store, a phone can report the price your
-own Walmart shows through `POST /api/v1/ingest`. The other built-in stores
-show one online price everywhere.
+a store near you. If it is not your store, choose your store in the server's
+own browser (below). The other built-in stores show one online price everywhere.
+
+**The server's browser.** The server reads several stores with a real Chrome
+of its own, and that browser keeps its cookies. The administrator can use it
+by hand from the Stores page ("Open in the server's browser"): the page shows
+a picture of the browser, passes on clicks and typing, and has a
+press-and-hold for "prove you are human" checks. Use it to:
+
+- sign in at a store, so the server reads the prices your account is shown;
+- choose your local store at a chain that prices per store;
+- get a store past a robot check it has put the server behind.
+
+When you are done, tick what you did. "I am signed in" is shown on the
+Stores page, because those prices are then that account's for everyone on
+the server. "Read with this browser from now on" matters for stores that are
+normally read with plain requests (Walmart, Target, Amazon, Hot Topic):
+plain requests carry neither a sign-in nor a chosen store, so the server
+switches to the browser for that store and falls back to plain requests if
+the browser is refused. Price checks that need the browser wait while
+someone is using it, and it is released 40 seconds after the page is closed.
+What you type goes from your web browser to your server, so do this at home
+or over HTTPS. This is the place to do sign-ins: the server is always on,
+and a phone then has nothing to report.
+
+Store sign-ins lapse. The server watches for that: it knows whether a
+store's pages ask a visitor to sign in, and when two pages in a row ask
+again after you signed in, the person who signed in gets an alert and the
+Stores page says "Looks signed out". Until someone signs in again the
+ordinary prices are recorded. This works where a signed-out page says "Sign
+in" and a signed-in one does not; where the server cannot see a difference
+(Harbor Freight's pages did not ask in testing), the Stores page says so
+instead of pretending. It has been tested with made-up pages and on real
+signed-out pages, not yet with a real account.
 
 ## Install on Ubuntu
 
@@ -219,12 +262,33 @@ prints the address to open. The first visitor creates the administrator
 account. To update later: `git pull`, build again, run the script again.
 
 - Settings: `/etc/amepricetrack.env` (see `deploy/amepricetrack.env.example`)
-- Data: `/var/lib/amepricetrack` (back up `amepricetrack.db`)
+- Data: `/var/lib/amepricetrack`
+- Backups: `/var/lib/amepricetrack/backups` (see "Backups" below)
 - Log: `journalctl -u amepricetrack -f`
 
 The site speaks plain HTTP on port 8787. To reach it from outside your home
 network, put it behind a reverse proxy with HTTPS (Caddy, nginx) or a private
 network such as Tailscale, and set `APT_SECURE_COOKIES=1` when using HTTPS.
+
+## Backups
+
+Everything (accounts, watchlists, price history, settings, keys) is in one
+file, `amepricetrack.db` in the data folder. Once a day the server writes a
+complete copy of it to the `backups` folder next to it, named by date
+(`amepricetrack-2026-11-17.db`), and keeps the newest 14. If a backup fails,
+the administrator gets an alert. Settings (as the administrator) shows when
+the last one was made and has a "Back up now" button;
+`amepricetrack backup [folder]` does the same from a terminal and is safe
+while the server runs.
+
+The copies are on the same disk as the data, which protects against a
+mistake or a damaged database, not against losing the disk. Point
+`APT_BACKUP_DIR` at another disk or a network folder for that. A backup
+holds the same sign-ins and keys as the database, so keep it as private.
+
+To go back to a backup: stop the server, replace `amepricetrack.db` with the
+copy (and delete `amepricetrack.db-wal` and `amepricetrack.db-shm` if they
+are there), and start the server again.
 
 ## Run it for development
 
@@ -251,6 +315,8 @@ All optional, set as environment variables.
 | `APT_BROWSER_ARGS` | none | Extra Chrome arguments, space separated. |
 | `APT_TARGET_STORE_ID` | `1375` | Target store whose prices are used until a ZIP code is set on the Stores page. |
 | `APT_SECURE_COOKIES` | off | Set to `1` when served over HTTPS. |
+| `APT_BACKUP_KEEP` | `14` | How many daily copies of the database to keep; `0` turns backups off. |
+| `APT_BACKUP_DIR` | `backups` in the data folder | Where those copies are written. |
 | `APT_LOG` | `info,sqlx=warn` | Log detail. |
 | `APT_DEBUG_PAGES` | off | Folder where the last unreadable page per store is saved. |
 
@@ -271,7 +337,8 @@ Two ways to see what *you* would pay:
 ## Android app
 
 A native Kotlin app in `android/`. It signs in to your server with the same
-username and password as the website and uses the same theme.
+username and password as the website. It looks like the website by default;
+each phone can instead be given a theme of its own in the app's Settings.
 
 - **Watchlist and product pages**: prices, deal labels, price history, the
   other stores' prices, and alert settings.
@@ -283,17 +350,37 @@ username and password as the website and uses the same theme.
   permission; without Play services, type the number under the barcode.
 - **Price match card**: the same card as on the website, sized for showing
   at a register.
-- **Notifications**: the app asks the server for new alerts about every 15
-  minutes (the shortest interval Android allows in the background).
+- **Notifications**: the app asks the server for new alerts every half hour
+  unless you choose otherwise.
+- **Instant alerts**: Settings can set up pushed alerts instead. It makes a
+  long random [ntfy](https://ntfy.sh) topic, has your server push to it,
+  opens the ntfy app subscribed to that topic, and sends a test. After that
+  the app's own checking can be turned off: ntfy delivers the alert, and its
+  "Open in app" button shows the product in AmePriceTrack. Alerts then pass
+  through the ntfy server in the address (ntfy.sh unless you run your own),
+  readable by anyone who knows the topic name. The Google Play build of ntfy
+  gets ntfy.sh messages through Google's push service; the F-Droid build, and
+  any ntfy server of your own, keeps a connection open instead.
+- **Watching closely**: a product's alert settings include how often the
+  server checks it.
 - **Prices from this phone**: the app opens product pages in its own
   browser and sends them to the server. Open a store there once to sign in
   or pick your local store, and its prices are kept as your own. This is how
   member and employee prices, your own Walmart store, and stores the server
   cannot read get in. Store passwords and sign-ins stay on the phone.
-  The phone also does this by itself, twice a day by default (Settings: off,
-  daily or twice a day), for the products the server cannot read and the
-  ones at stores you opened in the app. It reads at most 40 pages a run and
-  needs a network connection and a battery that is not low.
+  This is a fallback: the server does the reading, and signing in is better
+  done in the server's own browser (see "Stores and your area"). The phone
+  can also report by itself, which is **off unless you turn it on**. When
+  on, you choose daily or twice a day, only on Wi-Fi (the default), only
+  while charging, and which stores take part. A run starts with one small
+  request; reads only products the server cannot read or stores you opened
+  on the phone; skips anything read recently; loads pages without pictures,
+  fonts or video; sends them compressed; gives up on a store after two
+  failures; never runs on a low battery; and does not retry when the server
+  is out of reach.
+- **Battery**: alerts are checked every half hour by default (15 minutes,
+  hourly or off are the other choices), one small request each time. For
+  instant alerts with no checking at all, use "Instant alerts" above.
 - **Assistant**: ask the connected AI about your tracked prices.
 
 Build it with Android Studio, or from a terminal with a JDK (17 or newer)
@@ -317,10 +404,10 @@ except `login`.
 | Call | Purpose |
 | --- | --- |
 | `POST login` `{username, password, device_name}` | Returns a token. |
-| `GET me` | Account, theme, unread alerts, the stores (built-in and added), and the server's location. |
+| `GET me` | Account, theme, unread alerts, the stores (built-in and added), the server's location, and `check_interval_minutes`. |
 | `GET watches` / `POST watches` `{url, target_price_cents?}` | List and add products. `url` may be the text a store app shares. |
 | `GET products/{id}` | One product with price history. |
-| `POST products/{id}/watch`, `DELETE products/{id}/watch` | Change alert settings, stop tracking. |
+| `POST products/{id}/watch`, `DELETE products/{id}/watch` | Change alert settings (`check_minutes`, 15 to 1440, has the product checked that often; leave it out for the usual pace), stop tracking. |
 | `POST products/{id}/check` | Check now. |
 | `POST products/{id}/compare` | Search the other stores for this product (again). Results arrive in `other_stores` of `GET products/{id}`; `judged_by` is `ai` for matches the AI made. |
 | `POST comparisons/{id}` `{same}` | Confirm or reject a possible match. |
@@ -329,8 +416,10 @@ except `login`.
 | `GET find?q=&store=` | One store's first results (`title`, `url`); pass a `url` to `POST watches` to track it. |
 | `GET notifications?after={id}`, `POST notifications/read` | Alerts. |
 | `GET collect` | Pages the server cannot read itself and wants the device to load. |
-| `POST ingest` `{url, html, signed_in}` | A product page loaded on the device. |
+| `POST ingest` `{url, html, signed_in}` | A product page loaded on the device. The body may be sent with `Content-Encoding: gzip`. |
 | `POST chat` `{message}` | Ask the assistant. |
+| `GET push`, `POST push` `{ntfy_url}` | Where alerts are pushed; set or (with an empty address) clear the ntfy topic. |
+| `POST push/test` | Push a test alert now. |
 
 ## Layout
 
@@ -345,6 +434,7 @@ crates/server/src
   stores.rs      stores people add, and the server's location
   find.rs        finding a product by name or barcode
   health.rs      noticing when a whole store stops being readable
+  backup.rs      daily copies of the database
   browser.rs     driving Chrome
   scheduler.rs   the background checking loop
   pricing.rs     discounts, delivery, personal price, averages

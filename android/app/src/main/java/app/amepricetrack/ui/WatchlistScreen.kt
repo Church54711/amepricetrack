@@ -225,6 +225,7 @@ fun Badges(item: WatchItem) {
         val total = item.price.totalCents
         item.elsewhere?.takeIf { total != null && it.cents < total }?.let { Tag("${dollars(it.cents)} at ${it.storeName}", TagKind.Warn) }
         if (p.thirdParty == true) Tag("Marketplace seller", TagKind.Warn)
+        if (item.watch.checkMinutes != null) Tag("Watched closely", TagKind.Plain)
         val target = item.watch.targetPriceCents
         if (target != null && yours != null && yours <= target) Tag("Target reached", TagKind.Good)
         if (p.currentPriceCents == null && p.lastError != null) Tag("Could not read price", TagKind.Bad)

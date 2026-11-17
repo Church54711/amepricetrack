@@ -27,6 +27,10 @@ pub struct Config {
     pub target_store_id: String,
     /// Send cookies only over HTTPS. `APT_SECURE_COOKIES=1` when served behind HTTPS.
     pub secure_cookies: bool,
+    /// How many daily copies of the database are kept. `APT_BACKUP_KEEP`, default 14; 0 turns backups off.
+    pub backup_keep: usize,
+    /// Where those copies go. `APT_BACKUP_DIR`, default `backups` inside the data folder.
+    pub backup_dir: PathBuf,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -57,9 +61,16 @@ impl Config {
             Some(v) => v.parse().map_err(|_| anyhow::anyhow!("APT_BROWSER_PORT must be a port number, got '{v}'"))?,
             None => 9377,
         };
+        let data_dir = PathBuf::from(env("APT_DATA_DIR").unwrap_or_else(|| "data".into()));
+        let backup_keep = match env("APT_BACKUP_KEEP") {
+            Some(v) => v.parse().map_err(|_| anyhow::anyhow!("APT_BACKUP_KEEP must be a whole number, got '{v}'"))?,
+            None => 14,
+        };
         Ok(Config {
             bind,
-            data_dir: PathBuf::from(env("APT_DATA_DIR").unwrap_or_else(|| "data".into())),
+            backup_keep,
+            backup_dir: env("APT_BACKUP_DIR").map(PathBuf::from).unwrap_or_else(|| data_dir.join("backups")),
+            data_dir,
             public_url: env("APT_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_string()),
             check_interval: Duration::from_secs(minutes.clamp(15, 7 * 24 * 60) * 60),
             browser_path,

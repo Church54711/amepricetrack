@@ -33,6 +33,10 @@ pub fn routes() -> Router<App> {
         .route("/api/v1/collect", get(collect))
         .route("/api/v1/ingest", post(ingest))
         .route("/api/v1/chat", post(chat))
+        .route("/api/v1/push", get(push_settings).post(set_push))
+        .route("/api/v1/push/test", post(test_push))
+        // A phone sends product pages compressed, which is a fraction of the upload.
+        .layer(tower_http::decompression::RequestDecompressionLayer::new())
 }
 
 pub struct ApiError(StatusCode, String);
@@ -112,6 +116,8 @@ async fn me(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiResult
         "is_admin": user.is_admin,
         "unread_alerts": db::unread_count(&app.db, user.id).await?,
         "server_version": env!("CARGO_PKG_VERSION"),
+        // How often the server checks a product nobody asked to have watched closely.
+        "check_interval_minutes": app.cfg.check_interval.as_secs() / 60,
         "stores": stores,
         "location": crate::stores::location(&app.db).await?,
     })))
@@ -162,6 +168,8 @@ struct WatchBody {
     #[serde(default)]
     notify_back_in_stock: bool,
     note: Option<String>,
+    /// Check this product every so many minutes; leave out for the server's usual pace.
+    check_minutes: Option<i64>,
 }
 
 fn yes() -> bool {
@@ -177,16 +185,26 @@ async fn update_watch(
     if body.drop_percent.is_some_and(|p| !(p > 0.0 && p <= 100.0)) {
         return Err(service::user_problem("drop_percent must be between 0 and 100.").into());
     }
+    if body.check_minutes.is_some() && db::close_check(body.check_minutes).is_none() {
+        return Err(service::user_problem(format!(
+            "check_minutes must be between {} and {}.",
+            db::CLOSEST_CHECK_MINUTES,
+            db::LOOSEST_CHECK_MINUTES
+        ))
+        .into());
+    }
     let edit = WatchEdit {
         target_price_cents: body.target_price_cents.filter(|c| *c > 0),
         drop_percent: body.drop_percent,
         notify_any_drop: body.notify_any_drop,
         notify_back_in_stock: body.notify_back_in_stock,
         note: body.note.map(|n| n.trim().chars().take(200).collect::<String>()).filter(|n| !n.is_empty()),
+        check_minutes: body.check_minutes,
     };
     if !db::update_watch(&app.db, user.id, id, &edit).await? {
         return Err(not_found());
     }
+    app.wake.notify_one();
     alerts::evaluate(&app, id).await?;
     let view = service::watch_view(&app, user.id, id).await?.ok_or_else(not_found)?;
     Ok(Json(view_json(&view)))
@@ -336,6 +354,28 @@ struct IngestBody {
 async fn ingest(State(app): State<App>, CurrentUser(user): CurrentUser, Json(body): Json<IngestBody>) -> ApiResult {
     let result = service::ingest(&app, user.id, &body.url, &body.html, body.signed_in).await?;
     Ok(Json(json!(result)))
+}
+
+/// Where this person's alerts are pushed, so the app can offer to set it up.
+async fn push_settings(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiResult {
+    let settings = db::settings(&app.db, user.id).await?;
+    Ok(Json(json!({ "ntfy_url": settings.ntfy_url, "webhook": !settings.webhook_url.is_empty() })))
+}
+
+#[derive(Deserialize)]
+struct PushBody {
+    /// The ntfy topic address, such as https://ntfy.sh/my-topic. Empty turns pushing through ntfy off.
+    ntfy_url: String,
+}
+
+async fn set_push(State(app): State<App>, CurrentUser(user): CurrentUser, Json(body): Json<PushBody>) -> ApiResult {
+    let saved = service::set_ntfy(&app, user.id, &body.ntfy_url).await?;
+    Ok(Json(json!({ "ntfy_url": saved })))
+}
+
+async fn test_push(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiResult {
+    service::send_test_push(&app, user.id).await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

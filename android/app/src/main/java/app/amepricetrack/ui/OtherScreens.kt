@@ -3,6 +3,8 @@
 package app.amepricetrack.ui
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,6 +25,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -33,6 +36,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -51,11 +55,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.amepricetrack.App
 import app.amepricetrack.data.Alert
+import app.amepricetrack.data.newNtfyAddress
+import app.amepricetrack.data.ntfyAppLink
 import app.amepricetrack.work.AlertWorker
 import app.amepricetrack.work.ReportWorker
 import kotlinx.coroutines.launch
@@ -219,6 +227,99 @@ fun AssistantScreen(app: App) {
 
 // ---------------------------------------------------------------- settings
 
+/**
+ * Alerts pushed to the phone the moment the server has them, through the
+ * ntfy app, so this app does not have to ask the server every so often.
+ */
+@Composable
+private fun InstantAlertsCard(app: App, checksInBackground: Boolean, onStopChecking: () -> Unit, onPushOff: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    // Null until the server has said where alerts are pushed.
+    var saved by remember { mutableStateOf<String?>(null) }
+    var draft by rememberSaveable { mutableStateOf(newNtfyAddress()) }
+    var note by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
+    var busy by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        val result = app.attempt { app.api.pushSettings() }
+        result.onSuccess { saved = it.ntfyUrl }
+        result.onFailure { note = result.problem() to false }
+    }
+
+    fun run(done: String?, action: suspend () -> Unit) {
+        busy = true
+        scope.launch {
+            val result = app.attempt { action() }
+            busy = false
+            note = if (result.isSuccess) done?.let { it to true } else result.problem() to false
+        }
+    }
+
+    Card {
+        SectionTitle("Instant alerts")
+        note?.let { (text, good) -> Banner(text, good = good) }
+        val address = saved
+        when {
+            address == null -> Muted("Asking your server\u2026")
+            address.isEmpty() -> {
+                Muted(
+                    "Have alerts pushed to this phone the moment your server sees a price drop, instead of the app asking every so often. " +
+                        "This uses ntfy, a free notification app. Alerts then pass through the ntfy server in the address below, and anyone " +
+                        "who knows the topic name could read them, so it is a long random one.",
+                )
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it.trim() },
+                    label = { Text("ntfy topic address") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(enabled = !busy, onClick = { run(null) { saved = app.api.setNtfy(draft).ntfyUrl } }) { Text("Turn on") }
+            }
+            else -> {
+                Text("Your server pushes alerts to", fontWeight = FontWeight.Medium)
+                Muted(address)
+                Text("1. Subscribe in the ntfy app", fontWeight = FontWeight.Medium)
+                Muted("Opens ntfy on this topic. If ntfy is not installed yet, its store page opens: install it, then press this again.")
+                Button(onClick = {
+                    val link = ntfyAppLink(address)
+                    val opened = link != null && runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link))) }.isSuccess
+                    if (!opened) {
+                        val store = runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=io.heckel.ntfy")))
+                        }
+                        note = if (store.isSuccess) {
+                            "Install ntfy, then come back and press \u201cSubscribe\u201d again." to true
+                        } else {
+                            "Install the ntfy app (from Google Play or F-Droid), then subscribe to the address above in it." to false
+                        }
+                    }
+                }) { Text("Subscribe in ntfy") }
+                Text("2. Try it", fontWeight = FontWeight.Medium)
+                OutlinedButton(enabled = !busy, onClick = {
+                    run("Sent. It should appear as a notification from ntfy within a few seconds.") { app.api.testPush() }
+                }) { Text("Send a test alert") }
+                Text("3. Let ntfy do the waiting", fontWeight = FontWeight.Medium)
+                if (checksInBackground) {
+                    Muted("Once the test arrived, this app no longer needs to ask your server by itself, and each alert would otherwise show twice.")
+                    OutlinedButton(onClick = onStopChecking) { Text("Stop checking in the background") }
+                } else {
+                    Muted("This app does not check in the background. ntfy brings the alerts; \u201cOpen in app\u201d on one shows the product here.")
+                }
+                TextButton(enabled = !busy, onClick = {
+                    run("Your server no longer pushes alerts through ntfy.") {
+                        saved = app.api.setNtfy("").ntfyUrl
+                        draft = address
+                        onPushOff()
+                    }
+                }) { Text("Turn off") }
+            }
+        }
+    }
+}
+
 private fun themeName(id: String) = when (id) {
     "midnight" -> "Midnight Blue"
     "light" -> "Light"
@@ -231,11 +332,11 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
     val session by app.session.state.collectAsStateWithLifecycle()
     var canNotify by remember { mutableStateOf(AlertWorker.canNotify(app)) }
     var message by remember { mutableStateOf<String?>(null) }
+    var alertEvery by remember { mutableStateOf(app.session.alertEveryMinutes) }
+    // Whether the phone reports prices by itself; read again whenever this screen comes back.
     var autoReport by remember { mutableStateOf(app.session.autoReport) }
-    // What the last automatic report did; read again whenever the app comes back to the front.
-    var lastReport by remember { mutableStateOf<String?>(null) }
     LifecycleResumeEffect(Unit) {
-        lastReport = app.session.lastReportSummary?.let { "Last time, ${ago(app.session.lastReportAt / 1000)}: $it" }
+        autoReport = app.session.autoReport
         onPauseOrDispose {}
     }
     val scope = rememberCoroutineScope()
@@ -269,7 +370,30 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
         Card {
             SectionTitle("Notifications")
             if (canNotify) {
-                Muted("New alerts are checked about every 15 minutes while the phone can reach your server.")
+                Text("Check for new alerts", fontWeight = FontWeight.Medium)
+                val choices = listOf(15 to "15 min", 30 to "30 min", 60 to "Hourly", 0 to "Off")
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    choices.forEachIndexed { index, (minutes, label) ->
+                        SegmentedButton(
+                            selected = alertEvery == minutes,
+                            onClick = {
+                                alertEvery = minutes
+                                app.session.alertEveryMinutes = minutes
+                                AlertWorker.schedule(app, minutes)
+                            },
+                            shape = SegmentedButtonDefaults.itemShape(index, choices.size),
+                            icon = {},
+                        ) { Text(label, maxLines = 1) }
+                    }
+                }
+                Muted(
+                    if (alertEvery == 0) {
+                        "The app does not check in the background. Alerts still show when you open it, and your server can push them through ntfy."
+                    } else {
+                        "Each check is one small request, made while the phone can reach your server. Your server looks at each price " +
+                            "every few hours, so checking more often than half an hour gains little."
+                    },
+                )
             } else {
                 Muted("Allow notifications to hear about price drops without opening the app.")
                 Button(onClick = {
@@ -282,53 +406,64 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
             }
         }
 
+        InstantAlertsCard(
+            app = app,
+            checksInBackground = canNotify && alertEvery != 0,
+            onStopChecking = {
+                alertEvery = 0
+                app.session.alertEveryMinutes = 0
+                AlertWorker.schedule(app, 0)
+            },
+            onPushOff = {
+                // Without pushed alerts the app has to ask again, or alerts would only show when it is opened.
+                if (alertEvery == 0) {
+                    alertEvery = 30
+                    app.session.alertEveryMinutes = 30
+                    AlertWorker.schedule(app, 30)
+                }
+            },
+        )
+
         Card {
             SectionTitle("Prices from this phone")
             Muted(
-                "Sign in at a store inside the app, and the phone can report the prices that store shows you: " +
-                    "member and employee prices, your own Walmart store, and stores your server cannot read.",
+                "A fallback for what your server cannot read itself. Signing in at a store, or choosing your local store, is better " +
+                    "done in the server's own browser from the website's Stores page; then the phone has nothing to do.",
             )
             Button(onClick = onOpenPhone) { Text("Open") }
-
-            Text("Report by itself", fontWeight = FontWeight.Medium)
-            val choices = listOf("off" to "Off", "daily" to "Daily", "twice" to "Twice a day")
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                choices.forEachIndexed { index, (mode, label) ->
-                    SegmentedButton(
-                        selected = autoReport == mode,
-                        onClick = {
-                            autoReport = mode
-                            app.session.autoReport = mode
-                            ReportWorker.schedule(app, mode)
-                        },
-                        shape = SegmentedButtonDefaults.itemShape(index, choices.size),
-                        // No tick: the three labels need the room on a narrow phone.
-                        icon = {},
-                    ) { Text(label, maxLines = 1) }
-                }
-            }
             Muted(
-                if (autoReport == "off") {
-                    "The phone only reports prices when you open the screen above and start it."
-                } else {
-                    "In the background, the phone reads the products your server cannot read itself, and the ones at stores you " +
-                        "opened in the app, and sends those prices to your server." +
-                        (lastReport?.let { " $it" } ?: "")
+                when (autoReport) {
+                    "off" -> "The phone does not report by itself. Your server does the reading; this is for what it cannot do."
+                    "daily" -> "The phone also reports by itself once a day. Open to change how, or which stores."
+                    else -> "The phone also reports by itself twice a day. Open to change how, or which stores."
                 },
             )
         }
 
         Card {
             SectionTitle("Appearance")
-            Text(themeName(session.theme) + if (session.accent != null) ", with your own accent colour" else "")
-            Muted("The app uses the theme chosen on the website's Settings page.")
-            OutlinedButton(onClick = {
-                scope.launch {
-                    val result = app.attempt { app.api.me() }
-                    result.onSuccess { app.session.setLook(it.theme, it.accent) }
-                    result.onFailure { message = result.problem() }
+            Muted("This phone can look like the website or have a theme of its own. Other devices are not affected.")
+            val website = themeName(session.theme) + if (session.accent != null) ", with your accent colour" else ""
+            val choices = listOf<Pair<String?, String>>(null to "Same as the website ($website)") +
+                listOf("oled-gold", "midnight", "light", "system").map { it to themeName(it) }
+            choices.forEach { (id, label) ->
+                Row(
+                    Modifier.fillMaxWidth().clickable { app.session.setDeviceTheme(id) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = session.deviceTheme == id, onClick = { app.session.setDeviceTheme(id) })
+                    Text(label)
                 }
-            }) { Text("Update from the website") }
+            }
+            if (session.deviceTheme == null) {
+                OutlinedButton(onClick = {
+                    scope.launch {
+                        val result = app.attempt { app.api.me() }
+                        result.onSuccess { app.session.setLook(it.theme, it.accent) }
+                        result.onFailure { message = result.problem() }
+                    }
+                }) { Text("Update from the website") }
+            }
         }
     }
 }

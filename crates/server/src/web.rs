@@ -39,6 +39,10 @@ pub fn routes() -> Router<App> {
         .route("/stores/add", post(add_store))
         .route("/stores/location", post(save_location))
         .route("/stores/{id}/remove", post(remove_store))
+        .route("/stores/browser", get(browser_page))
+        .route("/stores/browser/screen", get(browser_screen))
+        .route("/stores/browser/act", post(browser_act))
+        .route("/stores/browser/done", post(browser_done))
         .route("/deals", get(deals))
         .route("/alerts", get(alerts_page))
         .route("/discounts", get(discounts_page).post(add_rule))
@@ -59,6 +63,7 @@ pub fn routes() -> Router<App> {
         .route("/settings/tokens/{id}/revoke", post(revoke_token))
         .route("/settings/users", post(add_user))
         .route("/settings/users/{id}/remove", post(remove_user))
+        .route("/settings/backup", post(backup_now))
         .route("/static/app.css", get(|| async { asset("text/css; charset=utf-8", ui::CSS) }))
         .route("/static/app.js", get(|| async { asset("text/javascript; charset=utf-8", ui::JS) }))
         .route("/favicon.svg", get(|| async { asset("image/svg+xml", ui::icon().0) }))
@@ -76,7 +81,7 @@ async fn security_headers(mut response: Response) -> Response {
     headers.insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; \
+            "default-src 'self'; img-src 'self' https: data: blob:; style-src 'self'; script-src 'self'; \
              frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
@@ -323,6 +328,7 @@ fn item_row(v: &WatchView, now: i64) -> Markup {
                     span { (ui::store_name(&p.retailer)) }
                     (ui::badges(v))
                     @if let Some(target) = v.watch.target_price_cents { span { "Target " (dollars(target)) } }
+                    @if let Some(minutes) = v.watch.check_minutes { span { "Watched closely: every " (interval_text(minutes as u64)) } }
                     @if let Some(checked) = p.last_success_at { span { "Checked " (ui::ago(now, checked)) } }
                 }
             }
@@ -562,6 +568,8 @@ async fn product_page(
     let store = ui::store_name(&p.retailer);
     let last_source = history.iter().rev().find(|h| !h.member).map(|h| h.source.as_str());
     let pending = p.current_price_cents.is_none() && p.last_error.is_none() && v.price.your_cents.is_none();
+    let usual_minutes = (app.cfg.check_interval.as_secs() / 60) as i64;
+    let paces = pace_choices(usual_minutes, v.watch.check_minutes);
 
     let body = html! {
         p.small { a href="/" { "\u{2190} Watchlist" } }
@@ -670,6 +678,23 @@ async fn product_page(
                             label for="note" { "Note" }
                             input #note type="text" name="note" maxlength="200" value=[v.watch.note.as_deref()];
                         }
+                        div.field {
+                            label for="check_minutes" { "Check the price" }
+                            select #check_minutes name="check_minutes" {
+                                option value="" selected[v.watch.check_minutes.is_none()] {
+                                    "At the usual pace (about every " (interval_text(usual_minutes as u64)) ")"
+                                }
+                                @for minutes in &paces {
+                                    option value=(minutes) selected[v.watch.check_minutes == Some(*minutes)] {
+                                        "Every " (interval_text(*minutes as u64))
+                                    }
+                                }
+                            }
+                            div.hint {
+                                "Closer checks catch a sale that only lasts a few hours. The same product at the other stores is checked as often. "
+                                "Stores notice frequent visits, so keep this for the few things you are waiting on."
+                            }
+                        }
                         button type="submit" { "Save" }
                     }
                 }
@@ -724,6 +749,19 @@ struct WatchForm {
     back_in_stock: Option<String>,
     #[serde(default)]
     note: String,
+    #[serde(default)]
+    check_minutes: String,
+}
+
+/// The paces a person can pick for one product, in minutes: the ones
+/// shorter than the server's usual pace, plus whatever is saved already.
+fn pace_choices(usual_minutes: i64, saved: Option<i64>) -> Vec<i64> {
+    let mut choices: Vec<i64> = [30, 60, 120].into_iter().filter(|m| *m < usual_minutes).collect();
+    if let Some(saved) = saved.filter(|s| !choices.contains(s)) {
+        choices.push(saved);
+        choices.sort();
+    }
+    choices
 }
 
 async fn update_watch(
@@ -740,12 +778,14 @@ async fn update_watch(
             notify_any_drop: checked(&form.any_drop),
             notify_back_in_stock: checked(&form.back_in_stock),
             note: Some(form.note.trim().chars().take(200).collect::<String>()).filter(|n| !n.is_empty()),
+            check_minutes: form.check_minutes.trim().parse().ok(),
         },
         (Err(p), _) | (_, Err(p)) => return back(&page, p),
     };
     if !db::update_watch(&app.db, user.id, id, &edit).await? {
         return Ok(not_found().await);
     }
+    app.wake.notify_one();
     // The new target may already be met.
     alerts::evaluate(&app, id).await?;
     Ok(go(&page, true, "Alert settings saved."))
@@ -1151,6 +1191,45 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
     let has_browser = app.fetcher.has_browser();
     let health = crate::health::overview(&app.db).await?;
     let now = db::now();
+    // What people set up for each store in the server's own browser.
+    let mut setups = std::collections::HashMap::new();
+    let mut sign_ins = std::collections::HashMap::new();
+    for retailer in retailers::RETAILERS.iter().map(|r| r.id.to_string()).chain(added.iter().map(|s| s.retailer.clone())) {
+        let setup = crate::stores::browser_setup(&app.db, &retailer).await?;
+        sign_ins.insert(retailer.clone(), crate::stores::sign_in_state(&app.db, &retailer, &setup).await?);
+        setups.insert(retailer, setup);
+    }
+    let set_up = |retailer: &str| -> Markup {
+        let setup = setups.get(retailer).cloned().unwrap_or_default();
+        html! {
+            @if setup.read_with_browser && has_browser { div.hint { "Read with the server's browser, where your store or sign-in is set." } }
+            @if let Some(who) = &setup.signed_in_by {
+                div.hint {
+                    "Signed in by " (who)
+                    @if let Some(at) = setup.signed_in_at { " on " (ui::when(at, true)) }
+                    ". Prices read here are that account's, for everyone on this server."
+                }
+                @match sign_ins.get(retailer).copied().flatten() {
+                    Some(crate::stores::SignIn::Lapsed(since)) => {
+                        div.hint {
+                            span.tag.warn { "Looks signed out" }
+                            " The store's pages have asked to sign in since " (ui::when(since, true))
+                            ", so the ordinary prices are being recorded."
+                            @if user.is_admin && has_browser { " Open it in the server's browser to sign in again." }
+                        }
+                    }
+                    Some(crate::stores::SignIn::Holds) => { div.hint { "The sign-in still held at the last price check." } }
+                    Some(crate::stores::SignIn::CannotTell) => {
+                        div.hint { "This store's pages do not show the server whether the sign-in still holds, so look in now and then." }
+                    }
+                    Some(crate::stores::SignIn::NotReadYet) | None => {}
+                }
+            }
+            @if user.is_admin && has_browser {
+                div.hint { a href={ "/stores/browser?store=" (encode(retailer)) } { "Open in the server's browser" } }
+            }
+        }
+    };
     // How a store's price checks are going, for the table below.
     let status = |retailer: &str| -> Markup {
         let Some(store) = health.iter().find(|h| h.retailer == retailer) else {
@@ -1225,8 +1304,13 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
                         None => { "The store is shown here after the first Walmart price check." }
                     }
                     div.hint {
-                        "Walmart chooses the store itself, from the internet connection of this server, and does not let the server pick another. "
-                        "If that is not your store, the phone app can report the prices your own Walmart shows."
+                        "Walmart chooses the store itself, from the internet connection of this server. If that is not your store, "
+                        @if user.is_admin && has_browser {
+                            a href="/stores/browser?store=walmart" { "open Walmart in the server's browser" }
+                            ", choose your store there, and tick “read with this browser”."
+                        } @else {
+                            "the administrator can choose your store in the server's own browser."
+                        }
                     }
                 }
                 dt { "Other stores" }
@@ -1243,7 +1327,7 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
                         tr {
                             td { (r.name) }
                             td.muted { (r.domain) }
-                            td { (reading_text(r.mode, has_browser)) }
+                            td { (reading_text(r.mode, has_browser)) (set_up(r.id)) }
                             td { (status(r.id)) }
                             td {}
                         }
@@ -1252,7 +1336,7 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
                         tr {
                             td { (s.name) }
                             td.muted { (s.retailer) }
-                            td { "Standard product data; searched at " span.muted { (s.search_url) } }
+                            td { "Standard product data; searched at " span.muted { (s.search_url) } (set_up(&s.retailer)) }
                             td { (status(&s.retailer)) }
                             td {
                                 @if user.is_admin || s.added_by == Some(user.id) {
@@ -1267,6 +1351,17 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
                 }
             } }
             p.hint { "You get an alert when a store has not been readable for two days, and another when it works again." }
+            @if has_browser {
+                p.hint {
+                    "The server reads prices with a browser of its own. "
+                    @if user.is_admin {
+                        "\u{201c}Open in the server's browser\u{201d} lets you use that browser from here: sign in at a store, choose your local store, "
+                        "or get past a \u{201c}prove you are human\u{201d} page. The server then reads the prices that browser is shown."
+                    } @else {
+                        "The administrator can sign in at a store in that browser, or choose a local store there."
+                    }
+                }
+            }
         }
 
         div.card #add {
@@ -1298,6 +1393,189 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
         }
     };
     Ok(html_page(ui::page(&chrome, "stores", "Stores", body)))
+}
+
+#[derive(Deserialize)]
+struct BrowserQuery {
+    #[serde(default)]
+    store: String,
+    /// Start again at the store's front page.
+    fresh: Option<String>,
+    msg: Option<String>,
+    err: Option<String>,
+}
+
+/// The server's own browser, used by hand from this page: to sign in at a
+/// store, choose a local store, or get past a "prove you are human" page.
+async fn browser_page(State(app): State<App>, CurrentUser(user): CurrentUser, Query(q): Query<BrowserQuery>) -> WebResult {
+    if !user.is_admin {
+        return Ok(go("/stores", false, "Only the administrator can use the server's browser."));
+    }
+    let Some(browser) = app.fetcher.browser() else {
+        return Ok(go("/stores", false, "This server has no browser set up. Install Chrome on it first (see the README)."));
+    };
+    let Some(home) = crate::stores::store_home(&q.store) else {
+        return Ok(not_found().await);
+    };
+    if let Err(e) = browser.hands_open(&q.store, &home, q.fresh.is_some()).await {
+        tracing::warn!("could not open the browser for a person: {e:#}");
+        return Ok(go("/stores", false, "The server's browser could not be started. The reason is in the server's log."));
+    }
+    let flash = PageQuery { msg: q.msg.clone(), err: q.err.clone(), store: None }.flash();
+    let chrome = chrome_with(&app, &user, flash).await?;
+    let name = ui::store_name(&q.store);
+    let setup = crate::stores::browser_setup(&app.db, &q.store).await?;
+    // Stores read with the browser anyway need no switch for it.
+    let always_browser = retailers::by_id(&q.store).is_some_and(|r| r.mode == FetchMode::Browser);
+    let body = html! {
+        p.small { a href="/stores" { "\u{2190} Stores" } }
+        div.page-head {
+            div {
+                h1 { "The server's browser: " (name) }
+                p.muted {
+                    "This is the browser the server reads prices with. Sign in at " (name) ", choose your local store, or get past a "
+                    "\u{201c}prove you are human\u{201d} page. What you set here stays in that browser, and the server reads the prices it is shown."
+                }
+            }
+        }
+        div.card #remote {
+            p.small.muted { "Showing " span #remote_address { (home) } }
+            img #remote_screen.remote-screen alt="The page in the server's browser. Click it to click on the page.";
+            p.small.muted #remote_status role="status" { "Loading the picture\u{2026}" }
+            div.actions {
+                button.secondary type="button" data-remote-action="back" { "Back" }
+                button.secondary type="button" data-remote-action="reload" { "Reload" }
+                button.secondary type="button" data-remote-scroll="-500" { "Scroll up" }
+                button.secondary type="button" data-remote-scroll="500" { "Scroll down" }
+                a.btn.secondary href={ "/stores/browser?store=" (encode(&q.store)) "&fresh=1" } { "Front page" }
+            }
+            form #remote_type autocomplete="off" {
+                div.row {
+                    div.grow {
+                        label for="remote_text" { "Type into the page" }
+                        input #remote_text type="password" autocomplete="off" autocapitalize="none" spellcheck="false";
+                    }
+                    button type="submit" { "Type it" }
+                }
+                div.actions {
+                    button.secondary type="button" data-remote-key="Enter" { "Enter" }
+                    button.secondary type="button" data-remote-key="Tab" { "Tab" }
+                    button.secondary type="button" data-remote-key="Backspace" { "Backspace" }
+                }
+                label.check {
+                    input #remote_show type="checkbox";
+                    span { "Show what I type" }
+                }
+                label.check {
+                    input #remote_hold type="checkbox";
+                    span { "My next click is press-and-hold for 10 seconds (for \u{201c}press and hold\u{201d} checks)" }
+                }
+            }
+            p.hint {
+                "Click a box on the picture first, then type into it from here. What you type travels from this page to your server, "
+                "so do this at home or over HTTPS. Price checks that need the browser wait while this page is open."
+            }
+        }
+        div.card {
+            h2 { "When you are done" }
+            form method="post" action="/stores/browser/done" {
+                input type="hidden" name="store" value=(q.store);
+                label.check {
+                    input type="checkbox" name="signed_in" checked[setup.signed_in_by.is_some()];
+                    span {
+                        "I am signed in at " (name) " in this browser"
+                        div.hint { "Shown on the Stores page, so everyone on this server knows whose prices these are." }
+                    }
+                }
+                @if !always_browser {
+                    label.check {
+                        input type="checkbox" name="read_with_browser" checked[setup.read_with_browser];
+                        span {
+                            "Read " (name) " prices with this browser from now on"
+                            div.hint {
+                                "Needed for your sign-in or the store you chose to count: otherwise " (name)
+                                " is read with plain requests, which carry neither. If the browser is refused, plain requests are used instead."
+                            }
+                        }
+                    }
+                }
+                button type="submit" { "Done" }
+            }
+        }
+    };
+    Ok(html_page(ui::page(&chrome, "stores", "The server's browser", body)))
+}
+
+/// A picture of the tab in use by hand.
+async fn browser_screen(State(app): State<App>, CurrentUser(user): CurrentUser) -> Response {
+    let Some(browser) = app.fetcher.browser().filter(|_| user.is_admin) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match browser.hands_screen().await {
+        Ok((picture, address)) => {
+            let mut response =
+                ([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")], picture).into_response();
+            if let Ok(value) = HeaderValue::from_str(&address) {
+                response.headers_mut().insert("x-page-address", value);
+            }
+            response
+        }
+        Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// Something the person did on the picture: a click, typing, a key.
+async fn browser_act(
+    State(app): State<App>,
+    CurrentUser(user): CurrentUser,
+    Json(action): Json<crate::browser::HandsAction>,
+) -> Response {
+    let Some(browser) = app.fetcher.browser().filter(|_| user.is_admin) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match browser.hands_act(&action).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct BrowserDoneForm {
+    store: String,
+    signed_in: Option<String>,
+    read_with_browser: Option<String>,
+}
+
+async fn browser_done(State(app): State<App>, CurrentUser(user): CurrentUser, Form(form): Form<BrowserDoneForm>) -> WebResult {
+    if !user.is_admin {
+        return Ok(go("/stores", false, "Only the administrator can use the server's browser."));
+    }
+    if crate::stores::store_home(&form.store).is_none() {
+        return Ok(not_found().await);
+    }
+    let before = crate::stores::browser_setup(&app.db, &form.store).await?;
+    let signed_in = checked(&form.signed_in);
+    let always_browser = retailers::by_id(&form.store).is_some_and(|r| r.mode == FetchMode::Browser);
+    // Someone who signs in again after the sign-in lapsed starts afresh; otherwise who and when are kept.
+    let kept = before.signed_in_by.clone().filter(|_| before.signed_out_since.is_none());
+    let setup = match (signed_in, kept) {
+        (true, Some(_)) => crate::stores::BrowserSetup { read_with_browser: true, ..before.clone() },
+        (true, None) => crate::stores::BrowserSetup {
+            signed_in_by: Some(user.username.clone()),
+            signed_in_at: Some(db::now()),
+            read_with_browser: true,
+            ..Default::default()
+        },
+        (false, _) => crate::stores::BrowserSetup { read_with_browser: checked(&form.read_with_browser), ..Default::default() },
+    };
+    // A sign-in only counts when the store is read with the browser that holds it.
+    let setup = crate::stores::BrowserSetup { read_with_browser: setup.read_with_browser && !always_browser, ..setup };
+    crate::stores::save_browser_setup(&app, &form.store, &setup).await?;
+    if let Some(browser) = app.fetcher.browser() {
+        browser.hands_close().await;
+    }
+    let name = ui::store_name(&form.store);
+    Ok(go("/stores", true, &format!("Saved. {name} prices are being read again now.")))
 }
 
 #[derive(Deserialize)]
@@ -1684,6 +1962,7 @@ async fn settings_view(app: &App, user: &User, flash: Option<Flash>, new_token: 
     .fetch_all(&app.db)
     .await?;
     let users = if user.is_admin { db::list_users(&app.db).await? } else { vec![] };
+    let backups = if user.is_admin { crate::backup::list(&app.cfg.backup_dir) } else { vec![] };
     let now = db::now();
     let address = app.cfg.public_url.clone().unwrap_or_else(|| format!("http://<this server's address>:{}", app.cfg.bind.port()));
 
@@ -1729,7 +2008,10 @@ async fn settings_view(app: &App, user: &User, flash: Option<Flash>, new_token: 
                 div.field {
                     label for="ntfy_url" { "ntfy topic address" }
                     input #ntfy_url type="url" name="ntfy_url" value=(s.ntfy_url) placeholder="https://ntfy.sh/your-private-topic-name";
-                    div.hint { "ntfy is a free push app for Android and iPhone. Pick a hard-to-guess topic name and subscribe to it in the app." }
+                    div.hint {
+                        "ntfy is a free push app for Android and iPhone. Pick a hard-to-guess topic name and subscribe to it in the app. "
+                        "The AmePriceTrack phone app can set this up for you, under Settings."
+                    }
                 }
                 div.field {
                     label for="webhook_url" { "Webhook address" }
@@ -1921,7 +2203,29 @@ async fn settings_view(app: &App, user: &User, flash: Option<Flash>, new_token: 
                     dt { "Browser for protected stores" }
                     dd { @match &app.cfg.browser_path { Some(p) => { (p.display()) } None => { "Not found. Staples, Best Buy, Kohl's and Harbor Freight need it." } } }
                     dt { "Data folder" } dd { (app.cfg.data_dir.display()) }
+                    dt { "Backups" }
+                    dd {
+                        @match backups.first() {
+                            Some(newest) => {
+                                "Last copy made "
+                                @match newest.made_at { Some(at) => { (ui::ago(now, at)) } None => { "on " (newest.day) } }
+                                "; " (backups.len()) " kept in " (app.cfg.backup_dir.display())
+                            }
+                            None => { "None yet. They go in " (app.cfg.backup_dir.display()) }
+                        }
+                        div.hint {
+                            @if app.cfg.backup_keep == 0 {
+                                "Daily backups are turned off (APT_BACKUP_KEEP=0)."
+                            } @else {
+                                "A copy of everything is written once a day and the newest " (app.cfg.backup_keep) " are kept. "
+                                "They are on the same disk as the data unless APT_BACKUP_DIR points somewhere else."
+                            }
+                        }
+                    }
                     dt { "Version" } dd { (env!("CARGO_PKG_VERSION")) }
+                }
+                form method="post" action="/settings/backup" data-once {
+                    button.secondary type="submit" data-busy="Copying\u{2026}" { "Back up now" }
                 }
             }
         }
@@ -1974,20 +2278,9 @@ struct AlertSettingsForm {
     webhook_url: String,
 }
 
-fn web_address(text: &str, what: &str) -> Result<String, Problem> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(String::new());
-    }
-    match url::Url::parse(text) {
-        Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => Ok(text.to_string()),
-        _ => Err(service::user_problem(format!("The {what} address must start with http:// or https://"))),
-    }
-}
-
 async fn store_alert_settings(app: &App, user_id: i64, form: &AlertSettingsForm) -> Result<(String, String), Problem> {
-    let ntfy = web_address(&form.ntfy_url, "ntfy")?;
-    let webhook = web_address(&form.webhook_url, "webhook")?;
+    let ntfy = service::web_address(&form.ntfy_url, "ntfy")?;
+    let webhook = service::web_address(&form.webhook_url, "webhook")?;
     sqlx::query("UPDATE user_settings SET ntfy_url = ?, webhook_url = ? WHERE user_id = ?")
         .bind(&ntfy)
         .bind(&webhook)
@@ -2016,7 +2309,7 @@ async fn test_alert(State(app): State<App>, CurrentUser(user): CurrentUser, Form
     if ntfy.is_empty() && webhook.is_empty() {
         return Ok(go("/settings", false, "Add an ntfy or webhook address first, then send a test."));
     }
-    let link = app.cfg.public_url.clone().unwrap_or_else(|| "https://example.com".into());
+    let link = app.cfg.public_url.clone().unwrap_or_default();
     let sent = alerts::push(
         &app.http,
         &ntfy,
@@ -2024,6 +2317,7 @@ async fn test_alert(State(app): State<App>, CurrentUser(user): CurrentUser, Form
         "AmePriceTrack test alert",
         "If you can read this, alerts will reach you here.",
         &link,
+        None,
     )
     .await;
     Ok(match sent {
@@ -2153,6 +2447,25 @@ async fn revoke_token(State(app): State<App>, CurrentUser(user): CurrentUser, Pa
         .execute(&app.db)
         .await?;
     Ok(go("/settings", true, "That device has been signed out."))
+}
+
+/// Writes a copy of the database now, in addition to the daily one.
+async fn backup_now(State(app): State<App>, CurrentUser(user): CurrentUser) -> WebResult {
+    if !user.is_admin {
+        return Ok(go("/settings", false, "Only the administrator can make a backup."));
+    }
+    Ok(match crate::backup::write(&app.db, &app.cfg.backup_dir).await {
+        Ok(backup) => {
+            if app.cfg.backup_keep > 0 {
+                crate::backup::prune(&app.cfg.backup_dir, app.cfg.backup_keep);
+            }
+            go("/settings", true, &format!("Backup written to {}.", backup.path.display()))
+        }
+        Err(e) => {
+            tracing::error!("backup on request failed: {e:#}");
+            go("/settings", false, &format!("The backup could not be written: {e:#}"))
+        }
+    })
 }
 
 async fn add_user(State(app): State<App>, CurrentUser(user): CurrentUser, Form(form): Form<Credentials>) -> WebResult {

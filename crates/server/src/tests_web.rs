@@ -405,3 +405,171 @@ async fn a_membership_with_free_delivery_needs_no_percent() {
     let (_, _, body) = send(&site, get("/settings", &cookie)).await;
     assert!(body.contains(r#"name="ignore_marketplace" checked"#), "the box stays ticked");
 }
+
+#[tokio::test]
+async fn what_was_set_up_in_the_servers_browser_is_saved_and_shown() {
+    let (site, app) = site_and_app().await;
+    let cookie = set_up(&site).await;
+
+    // This test server has no browser, so the page says so instead of opening one.
+    let (status, headers, _) = send(&site, get("/stores/browser?store=walmart", &cookie)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location(&headers).contains("no+browser+set+up"), "{}", location(&headers));
+    let (status, _, _) = send(&site, get("/stores/browser/screen", &cookie)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Saying "I am signed in, read it with the browser" is remembered per store.
+    let (_, headers, _) =
+        send(&site, post_form("/stores/browser/done", &cookie, "store=walmart&signed_in=on&read_with_browser=on")).await;
+    assert!(location(&headers).starts_with("/stores?msg="), "{}", location(&headers));
+    let setup = crate::stores::browser_setup(&app.db, "walmart").await.unwrap();
+    assert_eq!((setup.signed_in_by.as_deref(), setup.read_with_browser), (Some("sam"), true));
+    let (_, _, body) = send(&site, get("/stores", &cookie)).await;
+    assert!(body.contains("Signed in by sam"), "{body}");
+    assert!(body.contains("for everyone on this server"));
+
+    // Unticking both forgets it.
+    send(&site, post_form("/stores/browser/done", &cookie, "store=walmart")).await;
+    assert_eq!(crate::stores::browser_setup(&app.db, "walmart").await.unwrap(), crate::stores::BrowserSetup::default());
+    let (_, _, body) = send(&site, get("/stores", &cookie)).await;
+    assert!(!body.contains("Signed in by sam"));
+
+    // Someone who is not the administrator cannot use the browser or change this.
+    send(&site, post_form("/settings/users", &cookie, "username=alex&password=longenough")).await;
+    let (_, headers, _) = send(&site, post_form("/login", "", "username=alex&password=longenough")).await;
+    let other = cookie_from(&headers);
+    let (_, headers, _) = send(&site, post_form("/stores/browser/done", &other, "store=walmart&signed_in=on")).await;
+    assert!(location(&headers).starts_with("/stores?err="), "{}", location(&headers));
+    assert_eq!(crate::stores::browser_setup(&app.db, "walmart").await.unwrap().signed_in_by, None);
+    let (status, _, _) = send(&site, get("/stores/browser/screen", &other)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_page_sent_compressed_by_the_phone_is_read() {
+    use std::io::Write;
+
+    let site = site().await;
+    set_up(&site).await;
+    let login = json!({ "username": "sam", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let add = json!({ "url": "https://www.staples.com/chair/product_555" });
+    send(&site, post_json("/api/v1/watches", &token, add)).await;
+
+    let page = r#"<html><head><script type="application/ld+json">
+        {"@type":"Product","name":"Office Chair","offers":{"price":"89.99","availability":"https://schema.org/InStock"}}
+        </script></head><body></body></html>"#;
+    let report = json!({ "url": "https://www.staples.com/chair/product_555", "html": page, "signed_in": false }).to_string();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(report.as_bytes()).unwrap();
+    let request = Request::post("/api/v1/ingest")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_ENCODING, "gzip")
+        .body(Body::from(gzip.finish().unwrap()))
+        .unwrap();
+    let (status, _, body) = send(&site, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["price_cents"], 8999);
+}
+
+#[tokio::test]
+async fn a_product_can_be_watched_closely() {
+    use crate::db;
+    const FOUR_HOURS: i64 = 4 * 3600;
+
+    let (site, app) = site_and_app().await;
+    let cookie = set_up(&site).await;
+    send(&site, post_form("/watches", &cookie, ADD_CHAIR)).await;
+    assert_eq!(db::check_interval(&app.db, 1, FOUR_HOURS).await.unwrap(), FOUR_HOURS, "the usual pace to begin with");
+    let (_, _, body) = send(&site, get("/products/1", &cookie)).await;
+    assert!(body.contains("At the usual pace (about every 4 hours)"), "the choice is offered");
+
+    // The same product found at another store is checked as often as the tracked one.
+    let elsewhere = crate::retailers::identify("https://www.walmart.com/ip/123456").unwrap();
+    let match_id = db::upsert_product(&app.db, &elsewhere).await.unwrap();
+    sqlx::query("UPDATE comparisons SET status = 'found', product_id = ? WHERE source_product_id = 1 AND retailer = 'walmart'")
+        .bind(match_id)
+        .execute(&app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE products SET next_check_at = ?").bind(db::now() + FOUR_HOURS).execute(&app.db).await.unwrap();
+
+    let (_, headers, _) = send(&site, post_form("/products/1/watch", &cookie, "target=45&any_drop=on&check_minutes=60")).await;
+    assert!(location(&headers).starts_with("/products/1?msg="), "{}", location(&headers));
+    assert_eq!(db::check_interval(&app.db, 1, FOUR_HOURS).await.unwrap(), 3600);
+    assert_eq!(db::check_interval(&app.db, match_id, FOUR_HOURS).await.unwrap(), 3600);
+    // Both are due within the hour now, not in four.
+    let latest: i64 = sqlx::query_scalar("SELECT MAX(next_check_at) FROM products").fetch_one(&app.db).await.unwrap();
+    assert!(latest <= db::now() + 3600, "next check in {} seconds", latest - db::now());
+    let (_, _, body) = send(&site, get("/products/1", &cookie)).await;
+    assert!(body.contains(r#"<option value="60" selected>Every hour"#), "the choice is shown as saved");
+    let (_, _, body) = send(&site, get("/", &cookie)).await;
+    assert!(body.contains("Watched closely: every hour"), "the watchlist says so");
+
+    // The phone app sets it the same way; nonsense is refused, and leaving it out goes back to the usual pace.
+    let login = json!({ "username": "sam", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (status, _, body) = send(&site, post_json("/api/v1/products/1/watch", &token, json!({ "check_minutes": 5 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _, body) = send(&site, post_json("/api/v1/products/1/watch", &token, json!({ "check_minutes": 30 }))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["watch"]["check_minutes"], 30);
+    assert_eq!(db::check_interval(&app.db, match_id, FOUR_HOURS).await.unwrap(), 1800);
+    send(&site, post_json("/api/v1/products/1/watch", &token, json!({}))).await;
+    assert_eq!(db::check_interval(&app.db, 1, FOUR_HOURS).await.unwrap(), FOUR_HOURS);
+    let (_, _, body) = send(&site, get_api("/api/v1/me", &token)).await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["check_interval_minutes"], 240);
+}
+
+#[tokio::test]
+async fn the_phone_app_can_set_up_pushed_alerts() {
+    let site = site().await;
+    let cookie = set_up(&site).await;
+    let login = json!({ "username": "sam", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+
+    let (_, _, body) = send(&site, get_api("/api/v1/push", &token)).await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!({ "ntfy_url": "", "webhook": false }));
+    let (status, _, body) = send(&site, post_json("/api/v1/push/test", &token, json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("Add an ntfy or webhook address first"), "{body}");
+
+    // An address needs to be a web address with a topic name.
+    for bad in ["ntfy.sh/my-topic", "https://ntfy.sh/", "https://ntfy.sh/a/b"] {
+        let (status, _, body) = send(&site, post_json("/api/v1/push", &token, json!({ "ntfy_url": bad }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    // Nothing listens on this port, so the test alert fails at once without leaving this machine.
+    let topic = "http://127.0.0.1:9/apt-made-up-topic";
+    let (status, _, body) = send(&site, post_json("/api/v1/push", &token, json!({ "ntfy_url": topic }))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, body) = send(&site, get_api("/api/v1/push", &token)).await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["ntfy_url"], topic);
+    let (_, _, body) = send(&site, get("/settings", &cookie)).await;
+    assert!(body.contains(topic), "the website shows the same address");
+    let (status, _, body) = send(&site, post_json("/api/v1/push/test", &token, json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("could not be delivered"), "{body}");
+
+    let (_, _, body) = send(&site, post_json("/api/v1/push", &token, json!({ "ntfy_url": "" }))).await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["ntfy_url"], "");
+}
+
+#[tokio::test]
+async fn only_the_administrator_can_ask_for_a_backup() {
+    let site = site().await;
+    let admin = set_up(&site).await;
+    let (_, _, body) = send(&site, get("/settings", &admin)).await;
+    assert!(body.contains("Back up now") && body.contains("Backups"));
+    send(&site, post_form("/settings/users", &admin, "username=alex&password=longenough")).await;
+    let (_, headers, _) = send(&site, post_form("/login", "", "username=alex&password=longenough")).await;
+    let other = cookie_from(&headers);
+    let (_, _, body) = send(&site, get("/settings", &other)).await;
+    assert!(!body.contains("Back up now"));
+    let (_, headers, _) = send(&site, post_form("/settings/backup", &other, "")).await;
+    assert!(location(&headers).contains("err=Only+the+administrator"), "{}", location(&headers));
+}

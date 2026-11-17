@@ -339,6 +339,187 @@ async fn recheck_local_prices(app: &App) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------- the server's browser, used by hand
+
+/// What a person set up for one store in the server's own browser.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BrowserSetup {
+    /// Someone signed in at the store there: who, and when.
+    pub signed_in_by: Option<String>,
+    pub signed_in_at: Option<i64>,
+    /// Read this store with the browser even though plain requests work,
+    /// so the sign-in or the local store chosen there counts.
+    pub read_with_browser: bool,
+    /// Whether the first product page read after signing in still asked to
+    /// sign in. Only when it did not can a later request to sign in mean
+    /// the sign-in has lapsed.
+    pub prompt_after_sign_in: Option<bool>,
+    /// Pages in a row that asked to sign in again.
+    pub prompt_reads: u32,
+    /// Since when the store has looked signed out, once that was announced.
+    pub signed_out_since: Option<i64>,
+}
+
+/// Pages in a row that must ask to sign in before the sign-in is called lapsed.
+const LAPSE_READS: u32 = 2;
+
+/// What the server can say about a sign-in made in its browser.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SignIn {
+    /// Nothing has been read since the person signed in.
+    NotReadYet,
+    /// The last pages read did not ask to sign in, and signed-out pages here do.
+    Holds,
+    /// Pages ask to sign in again, since this time.
+    Lapsed(i64),
+    /// This store's pages look the same signed in or out, as far as the server can see.
+    CannotTell,
+}
+
+static RE_SIGN_IN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(?:>|aria-label\s*=\s*["'])\s*(?:hello,\s*)?(?:sign|log)[\s-]?in(?:\s*(?:or|/|&amp;|&)\s*[a-z ]{2,24})?\s*(?:<|["'])"#,
+    )
+    .unwrap()
+});
+
+/// True when a page offers to sign in, the way stores do in their header
+/// for a visitor who is not signed in ("Sign in", "Hello, sign in",
+/// "Log in / Register").
+pub fn shows_sign_in_prompt(html: &str) -> bool {
+    RE_SIGN_IN.is_match(html)
+}
+
+fn prompt_key(retailer: &str) -> String {
+    format!("signin_prompt_{retailer}")
+}
+
+/// What is known about the sign-in recorded in `setup`.
+pub async fn sign_in_state(db: &db::Db, retailer: &str, setup: &BrowserSetup) -> Result<Option<SignIn>, Problem> {
+    if setup.signed_in_by.is_none() {
+        return Ok(None);
+    }
+    if let Some(since) = setup.signed_out_since {
+        return Ok(Some(SignIn::Lapsed(since)));
+    }
+    let asked_when_signed_out = db::server_setting(db, &prompt_key(retailer)).await?.as_deref() == Some("yes");
+    Ok(Some(match setup.prompt_after_sign_in {
+        None => SignIn::NotReadYet,
+        Some(false) if asked_when_signed_out => SignIn::Holds,
+        _ => SignIn::CannotTell,
+    }))
+}
+
+/// Looks at a product page the server just read for whether the store's
+/// sign-in still holds, and tells the person who signed in when it does not.
+pub async fn note_reading(app: &App, retailer: &str, mode: FetchMode, html: &str) -> Result<(), Problem> {
+    let asks = shows_sign_in_prompt(html);
+    let before = browser_setup(&app.db, retailer).await?;
+    if before.signed_in_by.is_none() {
+        // Nobody is signed in here: remember whether a signed-out page asks to sign in.
+        let key = prompt_key(retailer);
+        let known = db::server_setting(&app.db, &key).await?;
+        if (asks && known.as_deref() != Some("yes")) || (!asks && known.is_none()) {
+            db::set_server_setting(&app.db, &key, if asks { "yes" } else { "no" }).await?;
+        }
+        return Ok(());
+    }
+    // A plain request carries no sign-in, so it says nothing about one.
+    if mode != FetchMode::Browser {
+        return Ok(());
+    }
+    let mut setup = before.clone();
+    let mut lapsed_now = false;
+    match setup.prompt_after_sign_in {
+        None => setup.prompt_after_sign_in = Some(asks),
+        // The pages asked to sign in even right after signing in: nothing can be told from them.
+        Some(true) => {}
+        Some(false) if asks => {
+            setup.prompt_reads += 1;
+            if setup.prompt_reads >= LAPSE_READS && setup.signed_out_since.is_none() {
+                setup.signed_out_since = Some(db::now());
+                lapsed_now = true;
+            }
+        }
+        Some(false) => {
+            setup.prompt_reads = 0;
+            setup.signed_out_since = None;
+        }
+    }
+    if setup != before {
+        db::set_server_setting(&app.db, &setup_key(retailer), &serde_json::to_string(&setup).map_err(anyhow::Error::from)?)
+            .await?;
+    }
+    if lapsed_now {
+        let name = retailers::display_name(retailer);
+        let title = format!("{name} looks signed out in the server's browser");
+        let body = format!(
+            "The last {LAPSE_READS} {name} pages the server read asked to sign in. Until someone signs in again, the prices recorded \
+             for {name} are the ordinary ones, not the account's. Open {name} in the server's browser from the Stores page to sign in again."
+        );
+        let link = app.cfg.public_url.as_ref().map(|base| format!("{base}/stores")).unwrap_or_default();
+        tracing::warn!(store = retailer, "{title}");
+        // The person who signed in, or failing that the administrators.
+        let signer = match &setup.signed_in_by {
+            Some(name) => db::user_by_name(&app.db, name).await?,
+            None => None,
+        };
+        let people: Vec<i64> = match signer {
+            Some(user) => vec![user.id],
+            None => db::list_users(&app.db).await?.into_iter().filter(|u| u.is_admin).map(|u| u.id).collect(),
+        };
+        for user_id in people {
+            crate::alerts::notify(app, user_id, None, "store", &title, &body, None, &link).await?;
+        }
+    }
+    Ok(())
+}
+
+fn setup_key(retailer: &str) -> String {
+    format!("browser_setup_{retailer}")
+}
+
+pub async fn browser_setup(db: &db::Db, retailer: &str) -> Result<BrowserSetup, Problem> {
+    let stored = db::server_setting(db, &setup_key(retailer)).await?;
+    Ok(stored.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default())
+}
+
+/// Saves what was set up for a store and applies it to price checks.
+pub async fn save_browser_setup(app: &App, retailer: &str, setup: &BrowserSetup) -> Result<(), Problem> {
+    let value = if *setup == BrowserSetup::default() {
+        String::new()
+    } else {
+        serde_json::to_string(setup).map_err(anyhow::Error::from)?
+    };
+    db::set_server_setting(&app.db, &setup_key(retailer), &value).await?;
+    apply_browser_setups(app).await?;
+    // Read that store's products again soon, the new way.
+    sqlx::query("UPDATE products SET next_check_at = 0 WHERE retailer = ?").bind(retailer).execute(&app.db).await?;
+    app.wake.notify_one();
+    Ok(())
+}
+
+/// Tells the price checker which stores to read with the browser first.
+pub async fn apply_browser_setups(app: &App) -> Result<(), Problem> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM server_settings WHERE key LIKE 'browser_setup_%'").fetch_all(&app.db).await?;
+    let stores = rows.into_iter().filter_map(|(key, value)| {
+        let setup: BrowserSetup = serde_json::from_str(&value).ok()?;
+        setup.read_with_browser.then(|| key.trim_start_matches("browser_setup_").to_string())
+    });
+    app.fetcher.set_browser_first(stores);
+    Ok(())
+}
+
+/// The page to open for a store in the server's browser: its front page.
+pub fn store_home(retailer: &str) -> Option<String> {
+    match retailers::by_id(retailer) {
+        Some(store) => Some(format!("https://www.{}/", store.domain)),
+        None => retailers::public_site(retailer).ok().map(|site| site.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +591,92 @@ mod tests {
         assert_eq!(detect_name(&site("hottopic.com"), spaced).as_deref(), Some("Hot Topic"));
         assert_eq!(detect_name(&shop, "<html><head><title>Welcome to our shop</title></head></html>"), None);
         assert_eq!(detect_name(&shop, "<html></html>"), None);
+    }
+
+    #[test]
+    fn pages_that_ask_to_sign_in() {
+        for asking in [
+            r#"<span class="nav-line-1">Hello, sign in</span>"#,
+            r#"<a href="/account/login"><div>Sign In</div><div>Account</div></a>"#,
+            r#"<button type="button" aria-label="Sign in">"#,
+            "<a href=\"/login\">\n   Log in / Register </a>",
+            "<a>Sign in or create account</a>",
+            "<button>Sign In &amp; Earn Rewards</button>",
+        ] {
+            assert!(shows_sign_in_prompt(asking), "{asking}");
+        }
+        for not_asking in [
+            r#"<span class="nav-line-1">Hello, Sam</span><a href="/signout">Sign out</a>"#,
+            "<p>Sign in to your account to see the member price on this item today.</p>",
+            r#"<script>{"signInText":"Sign in","url":"/signin"}</script>"#,
+            "<a>Design ink refills</a>",
+        ] {
+            assert!(!shows_sign_in_prompt(not_asking), "{not_asking}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_that_lapses_is_announced_once_to_the_person_who_signed_in() {
+        let app = crate::test_app().await;
+        let sam = db::create_user(&app.db, "sam", "h", true).await.unwrap();
+        let other = db::create_user(&app.db, "alex", "h", true).await.unwrap();
+        let asks = r#"<html><a href="/login">Sign In</a><h1>Chair</h1></html>"#;
+        let greets = r#"<html><a href="/account">Hi, Sam</a><h1>Chair</h1></html>"#;
+        let titles = |user: i64| {
+            let db = app.db.clone();
+            async move { db::notifications(&db, user, 0, 20).await.unwrap().into_iter().map(|n| n.title).collect::<Vec<_>>() }
+        };
+        let state = || async {
+            let setup = browser_setup(&app.db, "staples").await.unwrap();
+            sign_in_state(&app.db, "staples", &setup).await.unwrap()
+        };
+
+        // Before anyone signs in, the server learns what a signed-out page looks like.
+        note_reading(&app, "staples", FetchMode::Browser, asks).await.unwrap();
+        assert_eq!(state().await, None);
+
+        let signed_in = BrowserSetup { signed_in_by: Some("sam".into()), signed_in_at: Some(db::now()), ..Default::default() };
+        save_browser_setup(&app, "staples", &signed_in).await.unwrap();
+        assert_eq!(state().await, Some(SignIn::NotReadYet));
+        note_reading(&app, "staples", FetchMode::Browser, greets).await.unwrap();
+        assert_eq!(state().await, Some(SignIn::Holds));
+
+        // One page asking to sign in could be a fluke; two in a row is announced, once.
+        note_reading(&app, "staples", FetchMode::Browser, asks).await.unwrap();
+        assert_eq!(state().await, Some(SignIn::Holds));
+        assert!(titles(sam).await.is_empty());
+        note_reading(&app, "staples", FetchMode::Browser, asks).await.unwrap();
+        note_reading(&app, "staples", FetchMode::Browser, asks).await.unwrap();
+        assert!(matches!(state().await, Some(SignIn::Lapsed(_))));
+        assert_eq!(titles(sam).await, vec!["Staples looks signed out in the server's browser"]);
+        assert!(titles(other).await.is_empty(), "only the person who signed in is told");
+
+        // Signing in again starts over.
+        save_browser_setup(&app, "staples", &signed_in).await.unwrap();
+        note_reading(&app, "staples", FetchMode::Browser, greets).await.unwrap();
+        assert_eq!(state().await, Some(SignIn::Holds));
+        assert_eq!(titles(sam).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_store_whose_pages_always_ask_to_sign_in_raises_no_alarm() {
+        let app = crate::test_app().await;
+        let sam = db::create_user(&app.db, "sam", "h", true).await.unwrap();
+        let asks = r#"<html><a href="/login">Sign In</a></html>"#;
+        let signed_in = BrowserSetup { signed_in_by: Some("sam".into()), signed_in_at: Some(db::now()), ..Default::default() };
+        save_browser_setup(&app, "kohls", &signed_in).await.unwrap();
+        for _ in 0..4 {
+            note_reading(&app, "kohls", FetchMode::Browser, asks).await.unwrap();
+        }
+        let setup = browser_setup(&app.db, "kohls").await.unwrap();
+        assert_eq!(sign_in_state(&app.db, "kohls", &setup).await.unwrap(), Some(SignIn::CannotTell));
+        assert!(db::notifications(&app.db, sam, 0, 20).await.unwrap().is_empty());
+
+        // A page fetched with a plain request says nothing about a sign-in in the browser.
+        save_browser_setup(&app, "walmart", &signed_in).await.unwrap();
+        note_reading(&app, "walmart", FetchMode::Http, asks).await.unwrap();
+        let setup = browser_setup(&app.db, "walmart").await.unwrap();
+        assert_eq!(sign_in_state(&app.db, "walmart", &setup).await.unwrap(), Some(SignIn::NotReadYet));
     }
 
     #[test]

@@ -13,6 +13,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
+import okio.buffer
 import org.junit.Test
 
 /** The app's requests, checked against a stand-in server on this machine. */
@@ -83,6 +84,39 @@ class ApiClientTest {
         assertTrue(body.isNull("note"))
         assertFalse(body.getBoolean("notify_any_drop"))
         assertTrue(body.getBoolean("notify_back_in_stock"))
+        assertTrue("the usual pace is sent as nothing", body.isNull("check_minutes"))
+    }
+
+    @Test
+    fun aProductWatchedCloselySendsItsPaceAndReadsItBack() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody(
+                """{"product":{"id":7,"retailer":"staples","url":"u"},"watch":{"check_minutes":60},"price":{},"deal":{},"elsewhere":null,"store_name":"Staples"}""",
+            ),
+        )
+        val closely = WatchSettings(null, null, notifyAnyDrop = true, notifyBackInStock = false, note = null, checkMinutes = 60)
+        val saved = api.updateWatch(7, closely)
+        assertEquals(60, JSONObject(server.takeRequest().body.readUtf8()).getInt("check_minutes"))
+        assertEquals(60, saved.watch.checkMinutes)
+    }
+
+    @Test
+    fun pushedAlertsAreSetUpThroughTheServer() = runBlocking {
+        server.enqueue(MockResponse().setBody("""{"ntfy_url":"","webhook":true}"""))
+        val before = api.pushSettings()
+        assertEquals("", before.ntfyUrl)
+        assertTrue(before.webhook)
+        assertEquals("/api/v1/push", server.takeRequest().path)
+
+        server.enqueue(MockResponse().setBody("""{"ntfy_url":"https://ntfy.sh/apt-abc"}"""))
+        assertEquals("https://ntfy.sh/apt-abc", api.setNtfy("https://ntfy.sh/apt-abc").ntfyUrl)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("https://ntfy.sh/apt-abc", JSONObject(request.body.readUtf8()).getString("ntfy_url"))
+
+        server.enqueue(MockResponse().setResponseCode(400).setBody("""{"error":"The test could not be delivered: ntfy: connection refused"}"""))
+        assertEquals("The test could not be delivered: ntfy: connection refused", problemOf { api.testPush() }.message)
+        assertEquals("/api/v1/push/test", server.takeRequest().path)
     }
 
     @Test
@@ -92,7 +126,11 @@ class ApiClientTest {
         val result = api.ingest("https://www.staples.com/chair/product_555", html, signedIn = true)
         assertEquals(7500L, result.priceCents)
         assertEquals("member", result.recordedAs)
-        val body = JSONObject(server.takeRequest().body.readUtf8())
+        val request = server.takeRequest()
+        // Sent compressed: a page of repeated text shrinks to a sliver of its size.
+        assertEquals("gzip", request.getHeader("Content-Encoding"))
+        assertTrue("${request.bodySize} bytes", request.bodySize < html.length / 20)
+        val body = JSONObject(okio.GzipSource(request.body).buffer().readUtf8())
         assertEquals(html, body.getString("html"))
         assertTrue(body.getBoolean("signed_in"))
     }

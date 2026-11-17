@@ -105,6 +105,87 @@
     });
   }
 
+  // ---- The server's browser, used by hand: show its picture and pass on clicks and typing.
+  var remote = document.getElementById("remote");
+  if (remote) {
+    var picture = document.getElementById("remote_screen");
+    var remoteStatus = document.getElementById("remote_status");
+    var remoteAddress = document.getElementById("remote_address");
+    var typed = document.getElementById("remote_text");
+    var holdNext = document.getElementById("remote_hold");
+    var ended = false;
+
+    var refreshPicture = function () {
+      if (ended) return;
+      // A page left in the background stops asking, so price checks can go on.
+      if (document.hidden) { window.setTimeout(refreshPicture, 2000); return; }
+      fetch("/stores/browser/screen", { cache: "no-store" })
+        .then(function (r) {
+          if (r.status === 409) { ended = true; throw new Error("ended"); }
+          if (!r.ok) throw new Error("failed");
+          remoteAddress.textContent = r.headers.get("x-page-address") || "";
+          return r.blob();
+        })
+        .then(function (blob) {
+          var old = picture.src;
+          picture.src = URL.createObjectURL(blob);
+          if (old && old.indexOf("blob:") === 0) URL.revokeObjectURL(old);
+          if (remoteStatus.textContent.indexOf("Loading") === 0) remoteStatus.textContent = "";
+        })
+        .catch(function () {
+          remoteStatus.textContent = ended
+            ? "The browser was closed because this page was left alone. Reload the page to carry on."
+            : "The picture could not be loaded. Trying again.";
+        })
+        .finally(function () { window.setTimeout(refreshPicture, 1100); });
+    };
+    refreshPicture();
+
+    var sendAction = function (action, note) {
+      remoteStatus.textContent = note || "";
+      return fetch("/stores/browser/act", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(action)
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) { if (data.error) remoteStatus.textContent = data.error; else if (note) remoteStatus.textContent = ""; })
+        .catch(function () { remoteStatus.textContent = "Could not reach this server."; });
+    };
+
+    picture.addEventListener("click", function (event) {
+      var box = picture.getBoundingClientRect();
+      if (!box.width || !box.height) return;
+      var x = (event.clientX - box.left) / box.width;
+      var y = (event.clientY - box.top) / box.height;
+      if (holdNext.checked) {
+        holdNext.checked = false;
+        sendAction({ type: "hold", x: x, y: y, seconds: 10 }, "Pressing and holding for 10 seconds…");
+      } else {
+        sendAction({ type: "click", x: x, y: y });
+      }
+    });
+
+    document.getElementById("remote_type").addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (!typed.value) return;
+      sendAction({ type: "text", text: typed.value });
+      typed.value = "";
+    });
+    document.getElementById("remote_show").addEventListener("change", function (event) {
+      typed.type = event.target.checked ? "text" : "password";
+    });
+    remote.querySelectorAll("[data-remote-key]").forEach(function (button) {
+      button.addEventListener("click", function () { sendAction({ type: "key", key: button.dataset.remoteKey }); });
+    });
+    remote.querySelectorAll("[data-remote-action]").forEach(function (button) {
+      button.addEventListener("click", function () { sendAction({ type: button.dataset.remoteAction }); });
+    });
+    remote.querySelectorAll("[data-remote-scroll]").forEach(function (button) {
+      button.addEventListener("click", function () { sendAction({ type: "scroll", dy: Number(button.dataset.remoteScroll) }); });
+    });
+  }
+
   // ---- AI settings: fill in the address and model when the service changes.
   var provider = document.getElementById("ai_provider");
   if (provider) {

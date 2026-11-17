@@ -7,6 +7,7 @@ mod ai;
 mod alerts;
 mod api;
 mod auth;
+mod backup;
 mod browser;
 mod compare;
 mod config;
@@ -90,13 +91,24 @@ async fn main() -> anyhow::Result<()> {
         let (Some(store), Some(file)) = (args.get(2), args.get(3)) else {
             anyhow::bail!("usage: amepricetrack parse <store> <saved page>");
         };
-        println!("{:#?}", retailers::parse(store, &std::fs::read_to_string(file)?)?);
+        let page = std::fs::read_to_string(file)?;
+        println!("asks to sign in: {}", stores::shows_sign_in_prompt(&page));
+        println!("{:#?}", retailers::parse(store, &page)?);
         return Ok(());
     }
     // `amepricetrack judge-test [file]` runs the pairs with known answers past the AI model
     // named by APT_AI_PROVIDER, APT_AI_KEY and APT_AI_MODEL, and reports how it did.
     if args.get(1).map(String::as_str) == Some("judge-test") {
         return judge_test(args.get(2).map(String::as_str)).await;
+    }
+    // `amepricetrack backup [folder]` writes a copy of the database now, into the backup
+    // folder or the one named. It is safe to run while the server is running.
+    if args.get(1).map(String::as_str) == Some("backup") {
+        let dir = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| cfg.backup_dir.clone());
+        let db = db::open(&cfg.data_dir).await?;
+        let written = backup::write(&db, &dir).await?;
+        println!("{} ({} bytes)", written.path.display(), written.bytes);
+        return Ok(());
     }
     // `amepricetrack search <store> <words...>` lists the product links a store's search returns.
     if args.get(1).map(String::as_str) == Some("search") {
@@ -119,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
     let app: App = Arc::new(AppState { db, cfg, fetcher, http, wake: Notify::new(), compare_wake: Notify::new() });
     stores::refresh_names(&app.db).await?;
     stores::apply_saved_location(&app).await?;
+    stores::apply_browser_setups(&app).await.map_err(|e| anyhow::anyhow!("could not load the stores' browser settings: {e}"))?;
     tokio::spawn(scheduler::run(app.clone()));
     tokio::spawn(compare::tracking::run(app.clone()));
 
@@ -348,6 +361,9 @@ pub async fn test_app() -> App {
         browser_args: vec![],
         target_store_id: "1375".into(),
         secure_cookies: false,
+        // Tests that exercise backups name a folder of their own.
+        backup_keep: 0,
+        backup_dir: std::env::temp_dir().join("apt-test-backups"),
     };
     Arc::new(AppState {
         db: db::open_in_memory().await,

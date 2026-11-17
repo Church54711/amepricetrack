@@ -96,6 +96,9 @@ pub struct Fetcher {
     target_store_id: std::sync::RwLock<String>,
     target_key: Mutex<String>,
     last_request: Mutex<HashMap<String, Instant>>,
+    /// Stores that answer plain requests but are read with the browser
+    /// anyway, because a person signed in or chose their local store there.
+    browser_first: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl Fetcher {
@@ -118,6 +121,7 @@ impl Fetcher {
             target_store_id: std::sync::RwLock::new(cfg.target_store_id.clone()),
             target_key: Mutex::new(TARGET_DEFAULT_KEY.to_string()),
             last_request: Mutex::new(HashMap::new()),
+            browser_first: std::sync::RwLock::new(std::collections::HashSet::new()),
         })
     }
 
@@ -151,6 +155,30 @@ impl Fetcher {
         self.browser.as_ref()
     }
 
+    /// Replaces the list of stores read with the browser first.
+    pub fn set_browser_first(&self, stores: impl IntoIterator<Item = String>) {
+        if let Ok(mut current) = self.browser_first.write() {
+            *current = stores.into_iter().collect();
+        }
+    }
+
+    /// The readers to try for a store, in order.
+    fn reading_order(&self, retailer: &str, remembered: Option<FetchMode>) -> Vec<FetchMode> {
+        let known_store = retailers::by_id(retailer).is_some();
+        let preferred = retailers::default_mode(retailer);
+        if known_store && preferred == FetchMode::Browser {
+            // These stores are known to reject plain requests; do not bother them with one.
+            return vec![FetchMode::Browser];
+        }
+        // The browser holds the sign-in or the chosen local store; a plain request is the fallback.
+        if self.browser.is_some() && self.browser_first.read().is_ok_and(|stores| stores.contains(retailer)) {
+            return vec![FetchMode::Browser, FetchMode::Http];
+        }
+        let first = remembered.unwrap_or(preferred);
+        let second = if first == FetchMode::Http { FetchMode::Browser } else { FetchMode::Http };
+        vec![first, second]
+    }
+
     /// Waits until this store may be contacted again, then marks it as contacted.
     async fn take_turn(&self, store: &str) {
         let wait = {
@@ -175,16 +203,7 @@ impl Fetcher {
         url: &str,
         remembered: Option<FetchMode>,
     ) -> Result<Fetched, FetchError> {
-        let known_store = retailers::by_id(retailer).is_some();
-        let preferred = retailers::default_mode(retailer);
-        let order: Vec<FetchMode> = if known_store && preferred == FetchMode::Browser {
-            // These stores are known to reject plain requests; do not bother them with one.
-            vec![FetchMode::Browser]
-        } else {
-            let first = remembered.unwrap_or(preferred);
-            let second = if first == FetchMode::Http { FetchMode::Browser } else { FetchMode::Http };
-            vec![first, second]
-        };
+        let order = self.reading_order(retailer, remembered);
 
         let mut first_error = None;
         for mode in order {
@@ -357,4 +376,46 @@ pub fn root_cause(e: &dyn std::error::Error) -> String {
         cur = next;
     }
     cur.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fetcher(with_browser: bool) -> Fetcher {
+        let cfg = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: std::env::temp_dir(),
+            public_url: None,
+            check_interval: Duration::from_secs(3600),
+            // Never started in these tests; only whether one is set up matters.
+            browser_path: with_browser.then(|| "chrome".into()),
+            browser_port: 0,
+            browser_args: vec![],
+            target_store_id: "1375".into(),
+            secure_cookies: false,
+            backup_keep: 0,
+            backup_dir: std::env::temp_dir(),
+        };
+        Fetcher::new(&cfg).unwrap()
+    }
+
+    #[test]
+    fn a_store_set_up_in_the_browser_is_read_with_it_first() {
+        use FetchMode::{Browser, Http};
+        let f = fetcher(true);
+        assert_eq!(f.reading_order("walmart", None), vec![Http, Browser]);
+        assert_eq!(f.reading_order("staples", None), vec![Browser], "never bothered with a plain request");
+        assert_eq!(f.reading_order("shop.example", Some(Browser)), vec![Browser, Http], "what worked last time");
+
+        // Someone chose their local Walmart in the server's browser: the browser first, plain requests as the fallback.
+        f.set_browser_first(["walmart".to_string()]);
+        assert_eq!(f.reading_order("walmart", Some(Http)), vec![Browser, Http]);
+        assert_eq!(f.reading_order("target", None), vec![Http, Browser], "other stores are unchanged");
+
+        // Without a browser on the server the setting cannot apply.
+        let bare = fetcher(false);
+        bare.set_browser_first(["walmart".to_string()]);
+        assert_eq!(bare.reading_order("walmart", None), vec![Http, Browser]);
+    }
 }

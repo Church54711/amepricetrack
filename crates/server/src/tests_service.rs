@@ -1,6 +1,7 @@
 //! Tracking, alerts, discounts and phone reports working together.
 
 use super::*;
+
 use crate::retailers::Observation;
 use crate::test_app;
 
@@ -154,4 +155,37 @@ async fn assistant_is_told_about_prices_and_discounts() {
         Err(Problem::User(message)) => assert!(message.contains("Settings"), "{message}"),
         other => panic!("expected a setup message, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn saving_other_settings_does_not_announce_a_met_target_again() {
+    let app = test_app().await;
+    let user = db::create_user(&app.db, "sam", "h", true).await.unwrap();
+    sqlx::query("UPDATE user_settings SET auto_compare = 0").execute(&app.db).await.unwrap();
+    let id = add_by_url(&app, user, "https://www.staples.com/chair/product_555", None).await.unwrap();
+    let price = Observation { title: Some("Chair".into()), price_cents: Some(4000), ..Default::default() };
+    db::record_observation(&app.db, id, &price, "server", Audience::Public, None, None).await.unwrap();
+    alerts::evaluate(&app, id).await.unwrap();
+    let alerts_so_far = || async { db::notifications(&app.db, user, 0, 20).await.unwrap().len() };
+
+    let edit = |target: i64, note: &str, pace: Option<i64>| db::WatchEdit {
+        target_price_cents: Some(target),
+        drop_percent: None,
+        notify_any_drop: true,
+        notify_back_in_stock: false,
+        note: Some(note.to_string()),
+        check_minutes: pace,
+    };
+    // A target the price already meets is announced once.
+    db::update_watch(&app.db, user, id, &edit(4500, "", None)).await.unwrap();
+    alerts::evaluate(&app, id).await.unwrap();
+    assert_eq!(alerts_so_far().await, 1);
+    // A note, or watching it closely, changes nothing about the target.
+    db::update_watch(&app.db, user, id, &edit(4500, "for the office", Some(60))).await.unwrap();
+    alerts::evaluate(&app, id).await.unwrap();
+    assert_eq!(alerts_so_far().await, 1, "no second alert for the same target");
+    // A different target that is also met is news again.
+    db::update_watch(&app.db, user, id, &edit(4200, "for the office", Some(60))).await.unwrap();
+    alerts::evaluate(&app, id).await.unwrap();
+    assert_eq!(alerts_so_far().await, 2);
 }

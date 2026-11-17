@@ -5,7 +5,11 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.Buffer
+import okio.GzipSink
+import okio.buffer
 import org.json.JSONObject
 import java.io.IOException
 import java.net.URLEncoder
@@ -33,7 +37,20 @@ class ApiClient(
             .build()
     }
 
-    private suspend fun call(method: String, path: String, body: JSONObject? = null, server: String? = null): JSONObject =
+    /** The same text compressed. A product page shrinks to a fraction of its size. */
+    private fun compressed(text: String): RequestBody {
+        val packed = Buffer()
+        GzipSink(packed).buffer().use { it.writeUtf8(text) }
+        return packed.readByteString().toRequestBody(JSON)
+    }
+
+    private suspend fun call(
+        method: String,
+        path: String,
+        body: JSONObject? = null,
+        server: String? = null,
+        compress: Boolean = false,
+    ): JSONObject =
         withContext(Dispatchers.IO) {
             val base = server ?: serverUrl() ?: throw ApiException("Not signed in to a server.")
             val request = Request.Builder().url("$base/api/v1/$path").apply {
@@ -41,7 +58,15 @@ class ApiClient(
                 when (method) {
                     "GET" -> get()
                     "DELETE" -> delete()
-                    else -> post((body ?: JSONObject()).toString().toRequestBody(JSON))
+                    else -> {
+                        val text = (body ?: JSONObject()).toString()
+                        if (compress) {
+                            header("Content-Encoding", "gzip")
+                            post(compressed(text))
+                        } else {
+                            post(text.toRequestBody(JSON))
+                        }
+                    }
                 }
             }.build()
             val response = try {
@@ -95,6 +120,7 @@ class ApiClient(
             .put("notify_any_drop", settings.notifyAnyDrop)
             .put("notify_back_in_stock", settings.notifyBackInStock)
             .put("note", settings.note ?: JSONObject.NULL)
+            .put("check_minutes", settings.checkMinutes ?: JSONObject.NULL)
         return parseWatchItem(call("POST", "products/$id/watch", body))
     }
 
@@ -126,7 +152,7 @@ class ApiClient(
     /** Sends a product page this phone loaded, so the server can read the price on it. */
     suspend fun ingest(url: String, html: String, signedIn: Boolean): IngestResult {
         val body = JSONObject().put("url", url).put("html", html).put("signed_in", signedIn)
-        val result = call("POST", "ingest", body)
+        val result = call("POST", "ingest", body, compress = true)
         return IngestResult(
             priceCents = if (result.isNull("price_cents")) null else result.optLong("price_cents"),
             recordedAs = result.optString("recorded_as"),
@@ -143,6 +169,17 @@ class ApiClient(
     /** Has the server read both sides of a comparison again now. */
     suspend fun refreshComparison(comparisonId: Long) {
         call("POST", "comparisons/$comparisonId/refresh")
+    }
+
+    /** Where the server pushes this person's alerts. */
+    suspend fun pushSettings(): PushSettings = parsePushSettings(call("GET", "push"))
+
+    /** Has the server push alerts to this ntfy topic address; an empty one turns that off. */
+    suspend fun setNtfy(address: String): PushSettings = parsePushSettings(call("POST", "push", JSONObject().put("ntfy_url", address)))
+
+    /** Has the server push a test alert now. */
+    suspend fun testPush() {
+        call("POST", "push/test")
     }
 
     private fun encode(text: String): String = URLEncoder.encode(text, "UTF-8")
