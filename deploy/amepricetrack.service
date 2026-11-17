@@ -1,0 +1,25 @@
+[Unit]
+Description=AmePriceTrack price tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=amepricetrack
+Group=amepricetrack
+WorkingDirectory=/var/lib/amepricetrack
+# Chrome keeps its profile and cache under the home directory.
+Environment=HOME=/var/lib/amepricetrack
+Environment=APT_DATA_DIR=/var/lib/amepricetrack
+EnvironmentFile=-/etc/amepricetrack.env
+ExecStart=/usr/local/bin/amepricetrack
+Restart=on-failure
+RestartSec=5
+# Chrome and the virtual screen are child processes; stop them with the service.
+KillMode=control-group
+TimeoutStopSec=20
+
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

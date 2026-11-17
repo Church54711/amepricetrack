@@ -1,0 +1,10 @@
+/target
+/data
+*.db
+*.db-shm
+*.db-wal
+.env
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
