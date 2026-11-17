@@ -106,7 +106,9 @@ impl Fetcher {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".parse()?);
         headers.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse()?);
-        let http = reqwest::Client::builder()
+        // Stores are public websites: a name that resolves to the home network, or a
+        // redirect to it, is never followed.
+        let http = crate::net::public_only(reqwest::Client::builder())
             .user_agent(USER_AGENT)
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
@@ -235,6 +237,7 @@ impl Fetcher {
 
     async fn fetch_browser(&self, retailer: &str, url: &str) -> Result<(Observation, Option<String>), FetchError> {
         let browser = self.browser.as_ref().ok_or(FetchError::NeedsBrowser)?;
+        Self::public_only(url).await?;
         // Some stores refuse the very first visit from a browser they have not
         // seen, or show a one-time welcome page, then behave on the next
         // visit once their cookies are set. So a failed read is tried twice.
@@ -269,6 +272,7 @@ impl Fetcher {
             }
             FetchMode::Browser => {
                 let browser = self.browser.as_ref().ok_or(FetchError::NeedsBrowser)?;
+                Self::public_only(url).await?;
                 let mut refusal = String::new();
                 // As with product pages, a first refusal often clears on the second visit.
                 for attempt in 0..2 {
@@ -287,6 +291,15 @@ impl Fetcher {
                 }
                 Err(FetchError::Blocked(refusal))
             }
+        }
+    }
+
+    /// The browser looks names up by itself, so where it is sent is checked first.
+    async fn public_only(url: &str) -> Result<(), FetchError> {
+        if crate::net::resolves_public(url).await {
+            Ok(())
+        } else {
+            Err(FetchError::Other("that address is not a website on the public internet".into()))
         }
     }
 
@@ -396,6 +409,7 @@ mod tests {
             secure_cookies: false,
             backup_keep: 0,
             backup_dir: std::env::temp_dir(),
+            members_local_network: false,
         };
         Fetcher::new(&cfg).unwrap()
     }

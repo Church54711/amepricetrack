@@ -148,7 +148,16 @@ pub async fn notify(
         Some(id) if !settings.ntfy_url.is_empty() && uses_phone_app(&app.db, user_id).await? => Some(app_link(id)),
         _ => None,
     };
-    let (http, title, body) = (app.http.clone(), title.to_string(), body.to_string());
+    // Someone who is not the administrator cannot have the server call into the home network.
+    let http = match crate::net::client_for(app, user_id, &[&settings.ntfy_url, &settings.webhook_url]).await {
+        Ok(http) => http,
+        Err(crate::service::Problem::User(why)) => {
+            tracing::warn!(user = user_id, "alert not pushed: {why}");
+            return Ok(());
+        }
+        Err(crate::service::Problem::Internal(e)) => return Err(e),
+    };
+    let (title, body) = (title.to_string(), body.to_string());
     // Pushing is best effort and must not hold up the price checker.
     tokio::spawn(async move {
         if let Err(e) = push(&http, &settings.ntfy_url, &settings.webhook_url, &title, &body, &link, app_link.as_deref()).await {
@@ -252,6 +261,7 @@ mod tests {
             store_ships: None,
             ships_free: None,
             shipping_cents: None,
+            server_read_ok: None,
         }
     }
 

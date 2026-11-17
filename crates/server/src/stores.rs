@@ -204,6 +204,16 @@ pub async fn add(app: &App, user_id: i64, new: NewStore<'_>) -> Result<String, P
     {
         return Err(user_problem(format!("{} is already supported; nothing to add.", known.name)));
     }
+    // A store is shared by everyone on the server; changing one is for whoever added it.
+    let is_admin = db::is_admin(&app.db, user_id).await?;
+    let someone_elses = |name: &str| {
+        user_problem(format!("{name} is already added. Only the person who added it, or the administrator, can change it."))
+    };
+    if let Some(existing) = db::custom_stores(&app.db).await?.into_iter().find(|s| s.retailer == retailer) {
+        if existing.added_by != Some(user_id) && !is_admin {
+            return Err(someone_elses(&existing.name));
+        }
+    }
     let home = format!("{}://{}/", site.scheme(), site.host_str().unwrap_or_default());
     let typed_name = new.name.split_whitespace().collect::<Vec<_>>().join(" ");
     if typed_name.chars().count() > 40 {
@@ -238,7 +248,10 @@ pub async fn add(app: &App, user_id: i64, new: NewStore<'_>) -> Result<String, P
         typed_name
     };
 
-    db::save_custom_store(&app.db, &retailer, &name, &search_url, user_id).await?;
+    // Someone may have added it while this store's front page was being read.
+    if !db::save_custom_store(&app.db, &retailer, &name, &search_url, user_id, is_admin).await? {
+        return Err(someone_elses(&retailer));
+    }
     refresh_names(&app.db).await?;
     // Everything this person tracks gets looked up at the new store.
     if db::settings(&app.db, user_id).await?.auto_compare {
@@ -708,6 +721,12 @@ mod tests {
         assert!(matches!(add(&app, user, again).await, Err(Problem::User(_))));
         let local = NewStore { site: "http://192.168.1.20", name: "NAS", search: "http://192.168.1.20/s?q={q}" };
         assert!(matches!(add(&app, user, local).await, Err(Problem::User(_))));
+
+        // Someone else cannot repoint a store that everyone's searches use.
+        let other = db::create_user(&app.db, "alex", "h", false).await.unwrap();
+        let hijack = NewStore { site: "boxlunch.example", name: "Mine now", search: "boxlunch.example/elsewhere?q=pricetrack" };
+        assert!(matches!(add(&app, other, hijack).await, Err(Problem::User(_))));
+        assert_eq!(db::custom_stores(&app.db).await.unwrap()[0].search_url, "https://boxlunch.example/search?q={q}");
 
         assert_eq!(remove(&app, stores[0].id).await.unwrap().as_deref(), Some("BoxLunch"));
         assert!(db::custom_stores(&app.db).await.unwrap().is_empty());

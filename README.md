@@ -269,6 +269,20 @@ account. To update later: `git pull`, build again, run the script again.
 The site speaks plain HTTP on port 8787. To reach it from outside your home
 network, put it behind a reverse proxy with HTTPS (Caddy, nginx) or a private
 network such as Tailscale, and set `APT_SECURE_COOKIES=1` when using HTTPS.
+Behind a proxy, also set `APT_PUBLIC_URL` to the address you open the site
+with: forms are only accepted from the site's own address, and a proxy that
+does not pass that address on would otherwise have every form refused.
+
+**Who can reach what.** The server fetches addresses people give it. Store
+addresses must be public websites; a name that leads to a machine on your
+home network is refused. An AI service, ntfy topic or webhook may be on the
+home network (an Ollama or ntfy of your own), but only for the
+administrator, unless `APT_MEMBERS_LOCAL_NETWORK=1` extends that to
+everyone with an account. Where the server reads a product itself and someone else also
+tracks it, a different price reported by a phone stays that person's own,
+unless the administrator's phone sent it. Where the server cannot read the
+product, the phone's reading is all there is and is shared. Store pages are
+fetched directly, without any proxy set in the environment.
 
 ## Backups
 
@@ -317,6 +331,7 @@ All optional, set as environment variables.
 | `APT_SECURE_COOKIES` | off | Set to `1` when served over HTTPS. |
 | `APT_BACKUP_KEEP` | `14` | How many daily copies of the database to keep; `0` turns backups off. |
 | `APT_BACKUP_DIR` | `backups` in the data folder | Where those copies are written. |
+| `APT_MEMBERS_LOCAL_NETWORK` | off | Set to `1` to let people who are not the administrator point their AI service, ntfy topic or webhook at an address on the home network. |
 | `APT_LOG` | `info,sqlx=warn` | Log detail. |
 | `APT_DEBUG_PAGES` | off | Folder where the last unreadable page per store is saved. |
 
@@ -434,6 +449,7 @@ crates/server/src
   stores.rs      stores people add, and the server's location
   find.rs        finding a product by name or barcode
   health.rs      noticing when a whole store stops being readable
+  net.rs         keeping requests people ask for off the home network
   backup.rs      daily copies of the database
   browser.rs     driving Chrome
   scheduler.rs   the background checking loop

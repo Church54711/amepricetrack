@@ -473,7 +473,21 @@ async fn load_page(ws_url: &str, url: &str) -> Result<String> {
         }
     }
 
-    let html = evaluate(&mut ws, &mut id, "document.documentElement.outerHTML").await?;
+    // Where the page ended up: a store's page that sent the browser on to a machine on
+    // the home network is not read.
+    // The address and the page are taken in one look at the document, so they belong together.
+    const SNAPSHOT: &str = "JSON.stringify({ at: location.href, html: document.documentElement.outerHTML })";
+    let snapshot = evaluate(&mut ws, &mut id, SNAPSHOT).await;
     let _ = ws.close(None).await;
-    html.as_str().map(str::to_string).filter(|h| !h.is_empty()).ok_or_else(|| anyhow!("the browser returned an empty page"))
+    let snapshot: Value = snapshot?.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let address = snapshot["at"].as_str().unwrap_or_default();
+    // The browser's own error pages have no web address and are read as they are (they say what went wrong).
+    if address.is_empty() || (address.starts_with("http") && !crate::net::resolves_public(address).await) {
+        bail!("the page led to an address that is not on the public internet");
+    }
+    snapshot["html"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("the browser returned an empty page"))
 }

@@ -31,6 +31,10 @@ pub struct Config {
     pub backup_keep: usize,
     /// Where those copies go. `APT_BACKUP_DIR`, default `backups` inside the data folder.
     pub backup_dir: PathBuf,
+    /// Let people who are not the administrator point their AI service, ntfy
+    /// topic or webhook at an address on the home network.
+    /// `APT_MEMBERS_LOCAL_NETWORK=1`; off by default.
+    pub members_local_network: bool,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -69,6 +73,7 @@ impl Config {
         Ok(Config {
             bind,
             backup_keep,
+            members_local_network: env("APT_MEMBERS_LOCAL_NETWORK").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             backup_dir: env("APT_BACKUP_DIR").map(PathBuf::from).unwrap_or_else(|| data_dir.join("backups")),
             data_dir,
             public_url: env("APT_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_string()),

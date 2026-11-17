@@ -158,6 +158,75 @@ async fn assistant_is_told_about_prices_and_discounts() {
 }
 
 #[tokio::test]
+async fn a_phone_reading_is_only_shared_when_nobody_else_relies_on_the_product() {
+    let app = test_app().await;
+    let admin = db::create_user(&app.db, "sam", "h", true).await.unwrap();
+    let member = db::create_user(&app.db, "alex", "h", false).await.unwrap();
+    sqlx::query("UPDATE user_settings SET auto_compare = 0").execute(&app.db).await.unwrap();
+    let id = add_by_url(&app, admin, CHAIR, Some(5000)).await.unwrap();
+    add_by_url(&app, member, CHAIR, None).await.unwrap();
+    let page = |price: &str| {
+        format!(
+            r#"<html><head><title>Made up</title><script type="application/ld+json">
+            {{"@type":"Product","name":"Chair of lies","offers":{{"price":"{price}","availability":"https://schema.org/InStock"}}}}
+            </script></head></html>"#
+        )
+    };
+    // While the server cannot read the product, a phone's reading is all there is, and it is shared.
+    let fallback = ingest(&app, member, CHAIR, &page("95.00"), false).await.unwrap();
+    assert_eq!(fallback.recorded_as, "public");
+
+    // Once the server reads it itself, a made-up page from someone who shares the product
+    // changes nothing for the other person, and does not put off the server's next check.
+    let real = Observation { title: Some("Office Chair".into()), price_cents: Some(8999), ..Default::default() };
+    let by_browser = Some(crate::retailers::FetchMode::Browser);
+    db::record_observation(&app.db, id, &real, "server", Audience::Public, by_browser, Some(60)).await.unwrap();
+    alerts::evaluate(&app, id).await.unwrap();
+    let alerts_before = db::notifications(&app.db, admin, 0, 10).await.unwrap().len();
+    let due = db::product(&app.db, id).await.unwrap().unwrap().next_check_at;
+    let theirs = ingest(&app, member, CHAIR, &page("1.00"), false).await.unwrap();
+    assert_eq!(theirs.recorded_as, "member");
+    ingest(&app, member, CHAIR, &page("89.99"), false).await.unwrap();
+    assert_eq!(db::product(&app.db, id).await.unwrap().unwrap().next_check_at, due, "the same price again moves nothing");
+    let product = db::product(&app.db, id).await.unwrap().unwrap();
+    assert_eq!((product.current_price_cents, product.title.as_deref()), (Some(8999), Some("Office Chair")));
+    assert_eq!(db::notifications(&app.db, admin, 0, 10).await.unwrap().len(), alerts_before, "no false target alert");
+    // The sender sees the lower of the two, which here is their own claim; nobody else does.
+    assert_eq!(watch_view(&app, admin, id).await.unwrap().unwrap().price.your_cents, Some(8999));
+
+    // A reading from the administrator's phone in between does not change that.
+    assert_eq!(ingest(&app, admin, CHAIR, &page("88.00"), false).await.unwrap().recorded_as, "public");
+    assert_eq!(ingest(&app, member, CHAIR, &page("2.00"), false).await.unwrap().recorded_as, "member");
+    assert_eq!(db::product(&app.db, id).await.unwrap().unwrap().current_price_cents, Some(8800));
+
+    // The server stops being able to read it: the phone's readings are shared again, one after another.
+    db::record_failure(&app.db, id, "the store refused the request (robot check)", 600).await.unwrap();
+    for price in ["85.00", "84.00"] {
+        assert_eq!(ingest(&app, member, CHAIR, &page(price), false).await.unwrap().recorded_as, "public", "{price}");
+    }
+    assert_eq!(db::product(&app.db, id).await.unwrap().unwrap().current_price_cents, Some(8400));
+
+    // The administrator's phone is taken at its word, as before.
+    let ours = ingest(&app, admin, CHAIR, &page("79.99"), false).await.unwrap();
+    assert_eq!(ours.recorded_as, "public");
+    assert_eq!(db::product(&app.db, id).await.unwrap().unwrap().current_price_cents, Some(7999));
+}
+
+#[tokio::test]
+async fn a_new_delivery_charge_counts_as_a_change_even_at_the_same_price() {
+    let app = test_app().await;
+    let user = db::create_user(&app.db, "sam", "h", true).await.unwrap();
+    sqlx::query("UPDATE user_settings SET auto_compare = 0").execute(&app.db).await.unwrap();
+    let id = add_by_url(&app, user, WALMART, None).await.unwrap();
+    let free = Observation { price_cents: Some(4000), ships_free: Some(true), ..Default::default() };
+    let charged =
+        Observation { price_cents: Some(4000), ships_free: Some(false), shipping_cents: Some(699), ..Default::default() };
+    assert!(db::record_observation(&app.db, id, &free, "server", Audience::Public, None, None).await.unwrap());
+    assert!(!db::record_observation(&app.db, id, &free, "server", Audience::Public, None, None).await.unwrap(), "nothing new");
+    assert!(db::record_observation(&app.db, id, &charged, "server", Audience::Public, None, None).await.unwrap());
+}
+
+#[tokio::test]
 async fn saving_other_settings_does_not_announce_a_met_target_again() {
     let app = test_app().await;
     let user = db::create_user(&app.db, "sam", "h", true).await.unwrap();

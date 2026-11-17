@@ -9,13 +9,13 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 async fn site() -> Router {
-    super::routes().merge(crate::api::routes()).with_state(test_app().await)
+    super::site(test_app().await)
 }
 
 /// The site together with the app behind it, for tests that prepare data directly.
 async fn site_and_app() -> (Router, crate::App) {
     let app = test_app().await;
-    (super::routes().merge(crate::api::routes()).with_state(app.clone()), app)
+    (super::site(app.clone()), app)
 }
 
 async fn send(site: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
@@ -254,6 +254,10 @@ async fn stores_page_adds_and_removes_a_store_and_checks_the_zip_code() {
     // A built-in store or an address on the local network is refused with a reason.
     let (_, headers, _) = send(&site, post_form("/stores/add", &cookie, "site=walmart.com")).await;
     assert!(location(&headers).contains("err=Walmart+is+already+supported"), "{}", location(&headers));
+    assert!(
+        location(&headers).starts_with("/stores?err=") && location(&headers).ends_with("#add"),
+        "the message comes before the page position"
+    );
     let (_, headers, _) = send(&site, post_form("/stores/add", &cookie, "site=http%3A%2F%2F10.0.0.5")).await;
     assert!(location(&headers).contains("err=Only+public+store+websites"), "{}", location(&headers));
 
@@ -572,4 +576,89 @@ async fn only_the_administrator_can_ask_for_a_backup() {
     assert!(!body.contains("Back up now"));
     let (_, headers, _) = send(&site, post_form("/settings/backup", &other, "")).await;
     assert!(location(&headers).contains("err=Only+the+administrator"), "{}", location(&headers));
+}
+
+#[tokio::test]
+async fn a_form_posted_by_another_website_is_refused() {
+    let site = site().await;
+    let cookie = set_up(&site).await;
+    let post_from = |origin: &'static str, host: &'static str| {
+        Request::post("/settings/users")
+            .header(header::COOKIE, &cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::HOST, host)
+            .header(header::ORIGIN, origin)
+            .body(Body::from("username=intruder&password=longenough"))
+            .unwrap()
+    };
+    // Another service on the same machine, a page that hides where it is from, another site altogether.
+    for elsewhere in ["http://192.168.1.20:8080", "null", "https://evil.example", "https://192.168.1.20:8787"] {
+        let (status, _, body) = send(&site, post_from(elsewhere, "192.168.1.20:8787")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{elsewhere}");
+        assert!(body.contains("came from another website"), "{elsewhere}");
+    }
+    let (_, _, body) = send(&site, get("/settings", &cookie)).await;
+    assert!(!body.contains("intruder"), "no account was created");
+
+    // The site's own form, at the address it was opened with, works as before.
+    let (status, headers, _) = send(&site, post_from("http://192.168.1.20:8787", "192.168.1.20:8787")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location(&headers).starts_with("/settings?msg="), "{}", location(&headers));
+    // Behind a proxy that takes HTTPS, the proxy says which scheme the visitor used.
+    let proxied = Request::post("/settings/users")
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::HOST, "prices.example")
+        .header("x-forwarded-proto", "https")
+        .header(header::ORIGIN, "https://prices.example")
+        .body(Body::from("username=second&password=longenough"))
+        .unwrap();
+    let (status, _, _) = send(&site, proxied).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    // Pages tell browsers to name this site as the origin of its own forms.
+    let (_, headers, _) = send(&site, get("/settings", &cookie)).await;
+    assert_eq!(headers["referrer-policy"], "same-origin");
+}
+
+#[tokio::test]
+async fn only_one_first_account_can_be_created() {
+    let app = test_app().await;
+    let first = crate::db::create_first_user(&app.db, "sam", "h").await.unwrap();
+    let second = crate::db::create_first_user(&app.db, "eve", "h").await.unwrap();
+    assert!(first.is_some() && second.is_none());
+    let users = crate::db::list_users(&app.db).await.unwrap();
+    assert_eq!(users.iter().map(|u| (u.username.as_str(), u.is_admin)).collect::<Vec<_>>(), vec![("sam", true)]);
+    // The first account gets its settings row like any other.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_settings").fetch_one(&app.db).await.unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn someone_who_is_not_the_administrator_cannot_point_the_server_at_the_home_network() {
+    let site = site().await;
+    let admin = set_up(&site).await;
+    send(&site, post_form("/settings/users", &admin, "username=alex&password=longenough")).await;
+    let login = json!({ "username": "alex", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (_, headers, _) = send(&site, post_form("/login", "", "username=alex&password=longenough")).await;
+    let member = cookie_from(&headers);
+
+    // A numbered private address is refused when it is saved, from the app and from the website.
+    let local = json!({ "ntfy_url": "http://192.168.1.5:8080/prices" });
+    let (status, _, body) = send(&site, post_json("/api/v1/push", &token, local)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("Only the administrator"), "{body}");
+    let form = "ntfy_url=&webhook_url=http%3A%2F%2F10.0.0.7%2Fhook";
+    let (_, headers, _) = send(&site, post_form("/settings/alerts", &member, form)).await;
+    assert!(location(&headers).contains("err=That+address+is+on+the+home+network"), "{}", location(&headers));
+    // So is a local AI service, when asked for its models.
+    let form = "provider=ollama&api_key=&base_url=http%3A%2F%2F192.168.1.9%3A11434%2Fv1&model=&match_model=";
+    let (_, _, body) = send(&site, post_form("/settings/ai/models", &member, form)).await;
+    assert!(body.contains("Only the administrator"), "{body}");
+
+    // The administrator may: the address is saved (nothing is sent to it here).
+    let form = "ntfy_url=http%3A%2F%2F192.168.1.5%3A8080%2Fprices&webhook_url=";
+    let (_, headers, _) = send(&site, post_form("/settings/alerts", &admin, form)).await;
+    assert!(location(&headers).starts_with("/settings?msg="), "{}", location(&headers));
 }

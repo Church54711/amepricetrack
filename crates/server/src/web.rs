@@ -8,7 +8,7 @@ use crate::service::{self, Problem, WatchView};
 use crate::ui::{self, Chrome, Flash};
 use crate::{ai, alerts, App};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
@@ -71,6 +71,47 @@ pub fn routes() -> Router<App> {
         .layer(axum::middleware::map_response(security_headers))
 }
 
+/// The whole site: the pages and the phone API, with the checks every request goes through.
+pub fn site(app: App) -> Router {
+    routes()
+        .merge(crate::api::routes())
+        .layer(axum::middleware::from_fn_with_state(app.clone(), same_origin_writes))
+        .with_state(app)
+}
+
+/// Refuses a change that another website asked the browser to make.
+///
+/// The sign-in cookie is sent with any request to this server's address,
+/// including a form posted by a page from another site on the same network
+/// name. Browsers say where such a request came from; one that did not come
+/// from this site's own pages is turned away. Requests that name no origin
+/// (the phone app, scripts) are not a browser acting for another site.
+async fn same_origin_writes(State(app): State<App>, request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let changes_something = !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let (origin, host, forwarded_host, forwarded_scheme) = {
+        let text = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+        (text("origin"), text("host"), text("x-forwarded-host"), text("x-forwarded-proto"))
+    };
+    if let Some(origin) = origin.filter(|_| changes_something) {
+        // This server speaks plain HTTP; a proxy in front says so when the visitor used HTTPS.
+        // A page in a browser cannot set these headers on a request to another site, so the
+        // only senders that could forge them carry nobody's sign-in cookie.
+        let scheme = forwarded_scheme.as_deref().map(|s| s.split(',').next().unwrap_or(s).trim()).unwrap_or("http");
+        let is = |authority: &Option<String>| authority.as_deref().is_some_and(|a| origin == format!("{scheme}://{a}"));
+        let ours = is(&host) || is(&forwarded_host) || app.cfg.public_url.as_deref() == Some(origin.as_str());
+        if !ours {
+            tracing::warn!(origin, path = request.uri().path(), "refused a change requested from another site");
+            let page = ui::message_page(
+                "That did not work",
+                "This request came from another website, so it was not carried out. If you reach this server through a proxy \
+                 and see this on every form, set APT_PUBLIC_URL to the address you open it with.",
+            );
+            return (StatusCode::FORBIDDEN, page).into_response();
+        }
+    }
+    next.run(request).await
+}
+
 fn asset(content_type: &'static str, body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "public, max-age=604800")], body).into_response()
 }
@@ -86,7 +127,9 @@ async fn security_headers(mut response: Response) -> Response {
         ),
     );
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
-    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    // Other sites learn nothing of where a visitor came from; this site's own forms still
+    // say they came from here, which `same_origin_writes` relies on.
+    headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
     response
 }
 
@@ -145,9 +188,14 @@ fn encode(text: &str) -> String {
 
 /// Redirects to `path` with a message to show there.
 fn go(path: &str, ok: bool, text: &str) -> Response {
+    // A position on the page ("#add") goes last, after the message.
+    let (path, position) = match path.split_once('#') {
+        Some((before, position)) => (before, format!("#{position}")),
+        None => (path, String::new()),
+    };
     let joiner = if path.contains('?') { '&' } else { '?' };
     let key = if ok { "msg" } else { "err" };
-    Redirect::to(&format!("{path}{joiner}{key}={}", encode(text))).into_response()
+    Redirect::to(&format!("{path}{joiner}{key}={}{position}", encode(text))).into_response()
 }
 
 /// Sends the person back with the message when the problem is theirs to fix;
@@ -255,8 +303,11 @@ async fn setup_submit(State(app): State<App>, Form(form): Form<Credentials>) -> 
         return Ok((StatusCode::BAD_REQUEST, setup_view(Some(message))).into_response());
     }
     let hash = auth::hash_password(form.password).await?;
-    let id = db::create_user(&app.db, form.username.trim(), &hash, true).await?;
-    signed_in(&app, id).await
+    // Someone else may have finished setting up while the password was being hashed.
+    match db::create_first_user(&app.db, form.username.trim(), &hash).await? {
+        Some(id) => signed_in(&app, id).await,
+        None => Ok(Redirect::to("/login").into_response()),
+    }
 }
 
 async fn signed_in(app: &App, user_id: i64) -> WebResult {
@@ -2281,6 +2332,7 @@ struct AlertSettingsForm {
 async fn store_alert_settings(app: &App, user_id: i64, form: &AlertSettingsForm) -> Result<(String, String), Problem> {
     let ntfy = service::web_address(&form.ntfy_url, "ntfy")?;
     let webhook = service::web_address(&form.webhook_url, "webhook")?;
+    crate::net::client_for(app, user_id, &[&ntfy, &webhook]).await?;
     sqlx::query("UPDATE user_settings SET ntfy_url = ?, webhook_url = ? WHERE user_id = ?")
         .bind(&ntfy)
         .bind(&webhook)
@@ -2310,8 +2362,12 @@ async fn test_alert(State(app): State<App>, CurrentUser(user): CurrentUser, Form
         return Ok(go("/settings", false, "Add an ntfy or webhook address first, then send a test."));
     }
     let link = app.cfg.public_url.clone().unwrap_or_default();
+    let http = match crate::net::client_for(&app, user.id, &[&ntfy, &webhook]).await {
+        Ok(http) => http,
+        Err(p) => return back("/settings", p),
+    };
     let sent = alerts::push(
-        &app.http,
+        &http,
         &ntfy,
         &webhook,
         "AmePriceTrack test alert",
@@ -2398,7 +2454,8 @@ async fn ai_models(State(app): State<App>, CurrentUser(user): CurrentUser, Form(
     let result = async {
         let saved = db::settings(&app.db, user.id).await?;
         let cfg = ai::AiConfig::from_settings(&merge_ai_form(&saved, &form), false)?;
-        ai::list_models(&app.http, &cfg).await
+        let http = crate::net::client_for(&app, user.id, &[&cfg.base_url]).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        ai::list_models(&http, &cfg).await
     }
     .await;
     match result {

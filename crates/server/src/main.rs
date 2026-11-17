@@ -15,6 +15,7 @@ mod db;
 mod fetch;
 mod find;
 mod health;
+mod net;
 mod pricing;
 mod retailers;
 mod scheduler;
@@ -33,6 +34,8 @@ pub struct AppState {
     pub fetcher: fetch::Fetcher,
     /// For AI services and alert pushes.
     pub http: reqwest::Client,
+    /// The same, for people who may only reach public addresses (see `net`).
+    pub public_http: reqwest::Client,
     /// Wakes the price checker early.
     pub wake: Notify,
     /// Wakes the worker that looks products up at other stores.
@@ -119,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
     let db = db::open(&cfg.data_dir).await?;
     let fetcher = fetch::Fetcher::new(&cfg)?;
     let http = reqwest::Client::builder().user_agent("AmePriceTrack").build()?;
+    let public_http = net::public_only(reqwest::Client::builder().user_agent("AmePriceTrack")).build()?;
 
     match &cfg.browser_path {
         Some(path) => tracing::info!("browser for protected stores: {}", path.display()),
@@ -128,18 +132,16 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    let app: App = Arc::new(AppState { db, cfg, fetcher, http, wake: Notify::new(), compare_wake: Notify::new() });
+    let app: App = Arc::new(AppState { db, cfg, fetcher, http, public_http, wake: Notify::new(), compare_wake: Notify::new() });
     stores::refresh_names(&app.db).await?;
     stores::apply_saved_location(&app).await?;
     stores::apply_browser_setups(&app).await.map_err(|e| anyhow::anyhow!("could not load the stores' browser settings: {e}"))?;
     tokio::spawn(scheduler::run(app.clone()));
     tokio::spawn(compare::tracking::run(app.clone()));
 
-    let router = web::routes()
-        .merge(api::routes())
+    let router = web::site(app.clone())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(tower_http::compression::CompressionLayer::new())
-        .with_state(app.clone());
+        .layer(tower_http::compression::CompressionLayer::new());
 
     let listener = tokio::net::TcpListener::bind(app.cfg.bind)
         .await
@@ -364,12 +366,14 @@ pub async fn test_app() -> App {
         // Tests that exercise backups name a folder of their own.
         backup_keep: 0,
         backup_dir: std::env::temp_dir().join("apt-test-backups"),
+        members_local_network: false,
     };
     Arc::new(AppState {
         db: db::open_in_memory().await,
         fetcher: fetch::Fetcher::new(&cfg).unwrap(),
         cfg,
         http: reqwest::Client::new(),
+        public_http: net::public_only(reqwest::Client::builder()).build().unwrap(),
         wake: Notify::new(),
         compare_wake: Notify::new(),
     })

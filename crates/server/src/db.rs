@@ -88,6 +88,9 @@ pub struct Product {
     pub ships_free: Option<bool>,
     /// The delivery charge, when the page states one.
     pub shipping_cents: Option<i64>,
+    /// How the server's own last attempt to read it went; None before the
+    /// first attempt. Readings from phones do not change this.
+    pub server_read_ok: Option<bool>,
 }
 
 impl Product {
@@ -243,6 +246,43 @@ pub async fn create_user(db: &Db, username: &str, password_hash: &str, is_admin:
     Ok(id)
 }
 
+/// Creates the administrator, but only while there are no accounts at all.
+/// The check and the insert are one statement, so two people setting the
+/// server up at the same moment cannot both become administrator.
+pub async fn create_first_user(db: &Db, username: &str, password_hash: &str) -> Result<Option<i64>> {
+    let created = sqlx::query(
+        "INSERT INTO users (username, password_hash, is_admin, created_at)
+         SELECT ?, ?, 1, ? WHERE NOT EXISTS (SELECT 1 FROM users)",
+    )
+    .bind(username)
+    .bind(password_hash)
+    .bind(now())
+    .execute(db)
+    .await?;
+    if created.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let id = created.last_insert_rowid();
+    sqlx::query("INSERT INTO user_settings (user_id) VALUES (?)").bind(id).execute(db).await?;
+    Ok(Some(id))
+}
+
+pub async fn is_admin(db: &Db, user_id: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT is_admin FROM users WHERE id = ?").bind(user_id).fetch_optional(db).await?.unwrap_or(false))
+}
+
+/// True when someone else tracks this product, or compares against it.
+pub async fn others_rely_on(db: &Db, product_id: i64, user_id: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM watches WHERE product_id = ?1 AND user_id != ?2)
+             OR EXISTS (SELECT 1 FROM comparisons WHERE product_id = ?1 AND user_id != ?2)",
+    )
+    .bind(product_id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await?)
+}
+
 pub async fn settings(db: &Db, user_id: i64) -> Result<Settings> {
     let row: Option<Settings> =
         sqlx::query_as("SELECT * FROM user_settings WHERE user_id = ?").bind(user_id).fetch_optional(db).await?;
@@ -340,7 +380,8 @@ pub async fn check_within(db: &Db, user_id: i64, product_id: i64, seconds: i64) 
 pub async fn record_failure(db: &Db, product_id: i64, error: &str, retry_in: i64) -> Result<()> {
     let ts = now();
     sqlx::query(
-        "UPDATE products SET last_checked_at = ?, next_check_at = ?, fail_count = fail_count + 1, last_error = ?
+        "UPDATE products SET last_checked_at = ?, next_check_at = ?, fail_count = fail_count + 1, last_error = ?,
+            server_read_ok = 0
          WHERE id = ?",
     )
     .bind(ts)
@@ -381,21 +422,28 @@ pub async fn record_observation(
     };
 
     // Descriptive details: keep what we have when the new reading lacks a field.
-    sqlx::query(
+    // A reading that is one person's own only fills in what nobody has read yet.
+    let details = if audience == Audience::Public {
         "UPDATE products SET
             title = COALESCE(?, title), brand = COALESCE(?, brand), model = COALESCE(?, model),
             gtin = COALESCE(?, gtin), image_url = COALESCE(?, image_url), details = COALESCE(?, details)
-         WHERE id = ?",
-    )
-    .bind(&obs.title)
-    .bind(&obs.brand)
-    .bind(&obs.model)
-    .bind(&obs.gtin)
-    .bind(&obs.image_url)
-    .bind(&obs.details)
-    .bind(product_id)
-    .execute(db)
-    .await?;
+         WHERE id = ?"
+    } else {
+        "UPDATE products SET
+            title = COALESCE(title, ?), brand = COALESCE(brand, ?), model = COALESCE(model, ?),
+            gtin = COALESCE(gtin, ?), image_url = COALESCE(image_url, ?), details = COALESCE(details, ?)
+         WHERE id = ?"
+    };
+    sqlx::query(details)
+        .bind(&obs.title)
+        .bind(&obs.brand)
+        .bind(&obs.model)
+        .bind(&obs.gtin)
+        .bind(&obs.image_url)
+        .bind(&obs.details)
+        .bind(product_id)
+        .execute(db)
+        .await?;
 
     // Chains that price per store say which store they chose for the server.
     if let (Some(store), "server") = (&obs.local_store, source) {
@@ -435,6 +483,11 @@ pub async fn record_observation(
 
     let stock_changed = obs.in_stock.is_some() && obs.in_stock != before.in_stock;
     let price_changed = obs.price_cents.is_some() && obs.price_cents != before.current_price_cents;
+    // What delivery costs and who sells it decide which store is cheaper, as the price does.
+    let terms_changed = obs.price_cents.is_some()
+        && ((obs.ships_free.is_some() && (obs.ships_free != before.ships_free || obs.shipping_cents != before.shipping_cents))
+            || (obs.third_party.is_some() && obs.third_party != before.third_party)
+            || (obs.store_ships.is_some() && obs.store_ships != before.store_ships));
 
     if let Some(price) = obs.price_cents {
         if price_changed || stock_changed {
@@ -478,18 +531,20 @@ pub async fn record_observation(
 
     sqlx::query(
         "UPDATE products SET last_checked_at = ?, last_success_at = ?, fail_count = 0, last_error = NULL,
+            server_read_ok = CASE WHEN ? THEN 1 ELSE server_read_ok END,
             fetch_mode = COALESCE(?, fetch_mode), next_check_at = COALESCE(?, next_check_at)
          WHERE id = ?",
     )
     .bind(ts)
     .bind(ts)
+    .bind(source == "server")
     .bind(mode.map(FetchMode::as_str))
     .bind(next_check_in.map(|s| ts + s))
     .bind(product_id)
     .execute(db)
     .await?;
 
-    Ok(price_changed || stock_changed)
+    Ok(price_changed || stock_changed || terms_changed)
 }
 
 async fn insert_point(
@@ -675,19 +730,32 @@ pub async fn custom_stores(db: &Db) -> Result<Vec<CustomStore>> {
 }
 
 /// Adds a store, or updates its name and search address when the site is already listed.
-pub async fn save_custom_store(db: &Db, retailer: &str, name: &str, search_url: &str, added_by: i64) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO stores (retailer, name, search_url, added_by, created_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (retailer) DO UPDATE SET name = excluded.name, search_url = excluded.search_url",
+///
+/// A store that is already listed is only changed for the person who added
+/// it, or for anyone when `may_change_any` (the administrator). Returns
+/// false when the store belongs to someone else and was left alone.
+pub async fn save_custom_store(
+    db: &Db,
+    retailer: &str,
+    name: &str,
+    search_url: &str,
+    added_by: i64,
+    may_change_any: bool,
+) -> Result<bool> {
+    let saved = sqlx::query(
+        "INSERT INTO stores (retailer, name, search_url, added_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (retailer) DO UPDATE SET name = excluded.name, search_url = excluded.search_url
+         WHERE stores.added_by = excluded.added_by OR ?6",
     )
     .bind(retailer)
     .bind(name)
     .bind(search_url)
     .bind(added_by)
     .bind(now())
+    .bind(may_change_any)
     .execute(db)
     .await?;
-    Ok(())
+    Ok(saved.rows_affected() > 0)
 }
 
 /// Removes an added store and what was found there for tracked products.

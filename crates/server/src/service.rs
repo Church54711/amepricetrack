@@ -136,7 +136,21 @@ pub async fn ingest(app: &App, user_id: i64, url: &str, html: &str, signed_in: b
     let public_is_fresh = product.last_success_at.is_some_and(|t| now - t < 36 * 3600);
     let differs =
         obs.price_cents.is_some() && product.current_price_cents.is_some() && obs.price_cents != product.current_price_cents;
-    let audience = if signed_in && public_is_fresh && differs { Audience::Member(user_id) } else { Audience::Public };
+    // A page from a phone is that person's word for the price. Where the server reads the
+    // product itself and other people rely on it, a different price from a phone stays the
+    // sender's own, and the server's schedule is not moved. Where the server cannot read
+    // it, the phone's reading is all there is, and it is shared.
+    let trusted = db::is_admin(&app.db, user_id).await? || !db::others_rely_on(&app.db, product.id, user_id).await?;
+    let server_reads_it = product.server_read_ok == Some(true);
+    let second_opinion = !trusted && server_reads_it;
+    let audience =
+        if differs && ((signed_in && public_is_fresh) || second_opinion) { Audience::Member(user_id) } else { Audience::Public };
+
+    // A second opinion that agrees with the server adds nothing: the server's own reading,
+    // its description of the product and its schedule stand as they are.
+    if second_opinion && audience == Audience::Public {
+        return Ok(IngestResult { product_id: product.id, price_cents: obs.price_cents, recorded_as: "public" });
+    }
 
     // A public reading from the phone counts as a check, so the server waits a full interval.
     let interval = db::check_interval(&app.db, product.id, app.cfg.check_interval.as_secs() as i64).await?;
@@ -203,6 +217,7 @@ pub async fn set_ntfy(app: &App, user_id: i64, address: &str) -> Result<String, 
             ));
         }
     }
+    crate::net::client_for(app, user_id, &[&ntfy]).await?;
     sqlx::query("UPDATE user_settings SET ntfy_url = ? WHERE user_id = ?").bind(&ntfy).bind(user_id).execute(&app.db).await?;
     Ok(ntfy)
 }
@@ -214,8 +229,9 @@ pub async fn send_test_push(app: &App, user_id: i64) -> Result<(), Problem> {
         return Err(user_problem("Add an ntfy or webhook address first, then send a test."));
     }
     let link = app.cfg.public_url.clone().unwrap_or_default();
+    let http = crate::net::client_for(app, user_id, &[&settings.ntfy_url, &settings.webhook_url]).await?;
     alerts::push(
-        &app.http,
+        &http,
         &settings.ntfy_url,
         &settings.webhook_url,
         "AmePriceTrack test alert",
@@ -392,7 +408,8 @@ pub async fn ask(app: &App, user_id: i64, message: &str) -> Result<String, Probl
         .collect();
     turns.push(("user".into(), message.to_string()));
 
-    let reply = ai::complete(&app.http, &cfg, &system, &turns).await.map_err(|e| user_problem(e.to_string()))?;
+    let http = crate::net::client_for(app, user_id, &[&cfg.base_url]).await?;
+    let reply = ai::complete(&http, &cfg, &system, &turns).await.map_err(|e| user_problem(e.to_string()))?;
     db::add_chat_message(&app.db, user_id, "user", message).await?;
     db::add_chat_message(&app.db, user_id, "assistant", &reply).await?;
     Ok(reply)

@@ -225,6 +225,7 @@ mod tests {
             store_ships: None,
             ships_free: None,
             shipping_cents: None,
+            server_read_ok: None,
         }
     }
 

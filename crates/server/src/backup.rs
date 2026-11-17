@@ -65,14 +65,21 @@ pub fn list(dir: &Path) -> Vec<Backup> {
     found
 }
 
+/// One copy is written at a time: the daily one and "Back up now" share a file name.
+static WRITING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Writes a copy of the database into `dir`, replacing today's if there is one.
 pub async fn write(db: &Db, dir: &Path) -> Result<Backup> {
+    let _one_at_a_time = WRITING.lock().await;
     std::fs::create_dir_all(dir).with_context(|| format!("could not create the backup folder {}", dir.display()))?;
     let day = today();
     let path = dir.join(file_name(&day));
     // Written under another name first, so a half-written copy is never taken for a backup.
     let partial = dir.join(format!("{}.partial", file_name(&day)));
     let _ = std::fs::remove_file(&partial);
+    // The copy holds sign-ins and keys. The file is made first, empty and readable by the
+    // server's own account only, and SQLite then fills it.
+    create_private(&partial).with_context(|| format!("could not create a file in {}", dir.display()))?;
     // SQLite takes the file name as text in the statement itself; a quote in it is doubled.
     let target = partial.to_string_lossy().replace('\'', "''");
     sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{target}'")))
@@ -80,23 +87,24 @@ pub async fn write(db: &Db, dir: &Path) -> Result<Backup> {
         .await
         .with_context(|| format!("could not write a copy of the database to {}", dir.display()))?;
     // SQLite quietly writes nothing for a database that only lives in memory.
-    if !partial.exists() {
+    if std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0) == 0 {
+        let _ = std::fs::remove_file(&partial);
         anyhow::bail!("the database gave no copy to write to {}", dir.display());
     }
-    keep_private(&partial);
     std::fs::rename(&partial, &path).with_context(|| format!("could not put the backup in place at {}", path.display()))?;
     list(dir).into_iter().find(|b| b.day == day).context("the backup was written but cannot be found")
 }
 
-/// The copy holds sign-ins and keys, like the database itself: only the server's own account may read it.
-fn keep_private(path: &Path) {
+/// Creates an empty file that, on Unix, only the server's own account may read.
+fn create_private(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    let _ = path;
+    options.open(path).map(|_| ())
 }
 
 /// Removes all but the newest `keep` backups. Returns how many were removed.
@@ -231,6 +239,7 @@ mod tests {
             fetcher: crate::fetch::Fetcher::new(&cfg).unwrap(),
             cfg,
             http: reqwest::Client::new(),
+            public_http: reqwest::Client::new(),
             wake: tokio::sync::Notify::new(),
             compare_wake: tokio::sync::Notify::new(),
         });

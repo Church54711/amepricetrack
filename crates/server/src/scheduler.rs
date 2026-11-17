@@ -60,10 +60,11 @@ pub fn retry_delay(error: &FetchError, fails: i64, interval: i64) -> i64 {
 }
 
 pub async fn check_one(app: &App, product: &Product) {
-    let usual = app.cfg.check_interval.as_secs() as i64;
-    // Sooner for a product someone asked to have watched closely.
-    let interval = db::check_interval(&app.db, product.id, usual).await.unwrap_or(usual);
     let fetched = app.fetcher.fetch(&product.retailer, &product.retailer_sku, &product.url, product.remembered_mode()).await;
+    let usual = app.cfg.check_interval.as_secs() as i64;
+    // Sooner for a product someone asked to have watched closely. Asked after the
+    // reading, so a pace chosen while the page was loading counts.
+    let interval = db::check_interval(&app.db, product.id, usual).await.unwrap_or(usual);
     match fetched {
         Ok(found) => {
             // The page also shows whether a sign-in made in the server's browser still holds.

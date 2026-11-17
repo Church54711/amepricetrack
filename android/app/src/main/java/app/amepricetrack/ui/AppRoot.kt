@@ -111,14 +111,18 @@ private fun SignedIn(app: App, incoming: Incoming?, onIncomingHandled: () -> Uni
                 onIncomingHandled()
             }
             is Incoming.SharedText -> {
+                val text = incoming.text
+                // Marking it handled restarts this effect, so the adding runs on its own.
                 onIncomingHandled()
-                snackbar.showSnackbar("Adding it to your watchlist…")
-                val added = app.attempt { app.api.addWatch(incoming.text) }
-                added.onSuccess {
-                    watchlistVersion++
-                    open("product:${it.product.id}")
+                scope.launch {
+                    launch { snackbar.showSnackbar("Adding it to your watchlist…") }
+                    val added = app.attempt { app.api.addWatch(text) }
+                    added.onSuccess {
+                        watchlistVersion++
+                        open("product:${it.product.id}")
+                    }
+                    added.onFailure { snackbar.showSnackbar(added.problem()) }
                 }
-                added.onFailure { snackbar.showSnackbar(added.problem()) }
             }
             null -> {}
         }

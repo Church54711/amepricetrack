@@ -422,7 +422,10 @@ async fn search_one(app: &App, row: &Comparison) -> Result<()> {
 
     // The person's AI service, when one is connected, helps pick and judge.
     let settings = db::settings(&app.db, row.user_id).await?;
-    let advisor = ai::AiConfig::for_matching(&settings).ok().map(|cfg| Advisor::new(&app.http, cfg));
+    let advisor = match ai::AiConfig::for_matching(&settings) {
+        Ok(cfg) => crate::net::client_for(app, row.user_id, &[&cfg.base_url]).await.ok().map(|http| Advisor::new(&http, cfg)),
+        Err(_) => None,
+    };
 
     tracing::info!(product = source.id, store = store.retailer, ai = advisor.is_some(), "looking for the same product");
     match find_at_store(&app.fetcher, &source_facts, store, advisor.as_ref()).await {
@@ -435,8 +438,21 @@ async fn search_one(app: &App, row: &Comparison) -> Result<()> {
             let product_id = db::upsert_product(&app.db, &reference).await?;
             let usual = app.cfg.check_interval.as_secs() as i64;
             let interval = db::check_interval(&app.db, product_id, usual).await?;
-            db::record_observation(&app.db, product_id, &found.obs, "server", Audience::Public, Some(found.mode), Some(interval))
-                .await?;
+            let changed = db::record_observation(
+                &app.db,
+                product_id,
+                &found.obs,
+                "server",
+                Audience::Public,
+                Some(found.mode),
+                Some(interval),
+            )
+            .await?;
+            // The product may be one somebody already tracks: this reading is news for them too.
+            if changed {
+                alerts::evaluate(app, product_id).await?;
+                price_changed(app, product_id).await?;
+            }
             debug_assert!(found.score >= POSSIBLE);
             let status = if found.score >= SAME { "found" } else { "possible" };
             let judged_by = if found.by_ai { "ai" } else { "rules" };
@@ -702,7 +718,9 @@ mod tests {
     async fn an_added_store_is_searched_and_named_like_the_others() {
         let app = test_app().await;
         let user = db::create_user(&app.db, "sam", "h", true).await.unwrap();
-        db::save_custom_store(&app.db, "boxlunch.com", "BoxLunch", "https://www.boxlunch.com/search?q={q}", user).await.unwrap();
+        db::save_custom_store(&app.db, "boxlunch.com", "BoxLunch", "https://www.boxlunch.com/search?q={q}", user, false)
+            .await
+            .unwrap();
         let id = tracked(&app, user, "https://www.staples.com/chair/product_555", "Chair", 10000).await;
         let rows = for_product(&app.db, user, id).await.unwrap();
         let last = rows.last().unwrap();
