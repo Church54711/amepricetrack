@@ -333,8 +333,10 @@ Either way the installer writes `APT_PUBLIC_URL`, sets
 (`APT_BIND=127.0.0.1:8787`), so the old plain address stops working. Sign in
 again at the new address, and put it in the phone app.
 
-The Tailscale and Caddy steps have been run against stand-ins for those
-programs, not yet against a real Tailscale account or a real domain.
+What has been tried: the Caddy step with Caddy itself on a fresh Ubuntu, but
+with a domain that does not point at the machine, so no certificate was
+issued; the Tailscale step against a stand-in for the Tailscale program, not
+a real account.
 
 - Settings: `/etc/amepricetrack.env` (see `deploy/amepricetrack.env.example`)
 - Data: `/var/lib/amepricetrack`
@@ -485,7 +487,9 @@ each phone can instead be given a theme of its own in the app's Settings.
 - **Updates**: Settings shows the app's version and the server's. "Update"
   downloads the new app from the project's releases page and hands it to
   Android, which checks it is the same app signed with the same key. The
-  administrator can update the server from there too.
+  first time, Android asks you to allow AmePriceTrack to install updates.
+  The app closes while it is replaced; a notification says when the new
+  version is in. The administrator can update the server from there too.
 - **Prices from this phone**: the app opens product pages in its own
   browser and sends them to the server. Open a store there once to sign in
   or pick your local store, and its prices are kept as your own. This is how
