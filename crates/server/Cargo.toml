@@ -3,7 +3,7 @@ name = "amepricetrack"
 version = "0.1.0"
 edition = "2021"
 description = "Self-hosted price tracker with deal alerts"
-license = "MIT"
+license = "0BSD"
 
 [dependencies]
 anyhow = "1.0.104"
