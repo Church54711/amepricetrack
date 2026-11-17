@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AmePriceTrack</string>
+    <string name="share_label">Track price</string>
+    <string name="alerts_channel">Price alerts</string>
+    <string name="alerts_channel_description">Price drops, targets reached and items back in stock</string>
+</resources>

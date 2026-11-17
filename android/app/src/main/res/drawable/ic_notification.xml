@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- A price tag. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M21.4,11.6 L12.4,2.6 C12,2.2 11.5,2 11,2 H4 C2.9,2 2,2.9 2,4 v7 c0,0.5 0.2,1 0.6,1.4 l9,9 c0.8,0.8 2,0.8 2.8,0 l7,-7 c0.8,-0.8 0.8,-2 0,-2.8 Z M6.5,8 C5.7,8 5,7.3 5,6.5 S5.7,5 6.5,5 8,5.7 8,6.5 7.3,8 6.5,8 Z" />
+</vector>

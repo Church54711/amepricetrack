@@ -41,7 +41,7 @@ checking. Data lives in a single SQLite file.
 - **Several people** can share one server; watchlists, discounts and
   settings are per person.
 
-Not built yet: the Android app (the API it needs is in place).
+There is a companion Android app in `android/` (see "Android app" below).
 
 ## How each store is read
 
@@ -207,6 +207,37 @@ Two ways to see what *you* would pay:
    from it. Store passwords and cookies never leave the device. This is what
    the phone app will use for member, employee and app-only prices.
 
+## Android app
+
+A native Kotlin app in `android/`. It signs in to your server with the same
+username and password as the website and uses the same theme.
+
+- **Watchlist and product pages**: prices, deal labels, price history, the
+  other stores' prices, and alert settings.
+- **Add by sharing**: in a store's app or a browser, choose Share, then
+  "Track price". Or paste a link with the + button.
+- **Notifications**: the app asks the server for new alerts about every 15
+  minutes (the shortest interval Android allows in the background).
+- **Prices from this phone**: the app opens product pages in its own
+  browser and sends them to the server. Open a store there once to sign in
+  or pick your local store, and its prices are kept as your own. This is how
+  member and employee prices, your own Walmart store, and stores the server
+  cannot read get in. Store passwords and sign-ins stay on the phone.
+- **Assistant**: ask the connected AI about your tracked prices.
+
+Build it with Android Studio, or from a terminal with a JDK (17 or newer)
+and the Android SDK installed:
+
+```sh
+cd android
+./gradlew assembleDebug        # app/build/outputs/apk/debug/app-debug.apk
+./gradlew testDebugUnitTest
+```
+
+The phone has to be able to reach the server, for example on the same Wi-Fi.
+The app allows plain HTTP because a home server usually has no certificate;
+use HTTPS if you expose the server beyond your home network.
+
 ## Phone API
 
 JSON under `/api/v1`, with `Authorization: Bearer <token>` on every call
@@ -247,4 +278,5 @@ crates/server/src
   web.rs, ui.rs  the website            (static/ holds the CSS and script)
   api.rs         the phone API
 deploy/          Ubuntu service file and install script
+android/         the Android app (Kotlin, Jetpack Compose)
 ```

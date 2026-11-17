@@ -266,6 +266,7 @@ async fn collect(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiR
             "store": p.retailer,
             "store_name": retailers::display_name(&p.retailer),
             "url": p.url,
+            "title": p.display_title(),
             "last_success_at": p.last_success_at,
         });
         let server_cannot = !has_browser && retailers::default_mode(&p.retailer) == FetchMode::Browser;

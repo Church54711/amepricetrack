@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A gold "A" on black, matching the default OLED Black and Gold theme. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#E8B923"
+        android:fillType="evenOdd"
+        android:pathData="M49,33 L59,33 L76,75 L66.5,75 L62.9,65.5 L45.1,65.5 L41.5,75 L32,75 Z M54,42.5 L48.1,57.8 L59.9,57.8 Z" />
+</vector>
