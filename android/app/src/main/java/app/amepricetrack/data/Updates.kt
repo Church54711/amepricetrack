@@ -6,7 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import app.amepricetrack.BuildConfig
+import app.amepricetrack.MainActivity
+import app.amepricetrack.R
+import app.amepricetrack.work.AlertWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -200,6 +205,36 @@ fun installProblem(status: Int, detail: String?): String = when (status) {
             "Uninstall it, then install the new version from the releases page once. Updates work from then on."
     PackageInstaller.STATUS_FAILURE_BLOCKED -> "This phone blocked the update. Allow AmePriceTrack to install apps in Android's settings."
     else -> "The update could not be installed" + if (detail.isNullOrBlank()) "." else " ($detail)."
+}
+
+/**
+ * Android closes the app while it replaces it and does not open it again.
+ * This runs once the new version is in, and says so with a notification
+ * that opens the app.
+ */
+class UpdatedReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_MY_PACKAGE_REPLACED || !AlertWorker.canNotify(context)) return
+        AlertWorker.createChannel(context)
+        val open = PendingIntent.getActivity(
+            context,
+            0,
+            Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(context, AlertWorker.CHANNEL)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("AmePriceTrack was updated")
+            .setContentText("Version ${BuildConfig.VERSION_NAME} is installed. Tap to open.")
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        runCatching { NotificationManagerCompat.from(context).notify(UPDATED_NOTIFICATION, notification) }
+    }
+
+    private companion object {
+        const val UPDATED_NOTIFICATION = -2
+    }
 }
 
 /** Hears from Android how an installation went. */

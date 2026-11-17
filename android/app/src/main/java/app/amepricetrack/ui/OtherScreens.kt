@@ -365,7 +365,7 @@ private fun UpdatesCard(app: App) {
         val found = release
         when (val now = step) {
             is UpdateStep.Downloading -> Muted("Downloading\u2026 ${now.percent}%")
-            UpdateStep.Installing -> Muted("Installing. Android may ask you to confirm; the app then restarts.")
+            UpdateStep.Installing -> Muted("Installing. Android may ask you to confirm. The app closes while it is replaced; open it again afterwards.")
             is UpdateStep.Failed -> Banner(now.message, good = false)
             UpdateStep.Idle -> when {
                 found != null -> Muted("Version ${found.version} is available.")
