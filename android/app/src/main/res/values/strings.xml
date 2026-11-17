@@ -4,4 +4,6 @@
     <string name="share_label">Track price</string>
     <string name="alerts_channel">Price alerts</string>
     <string name="alerts_channel_description">Price drops, targets reached and items back in stock</string>
+    <string name="widget_label">Best prices</string>
+    <string name="widget_description">The best prices on your watchlist right now</string>
 </resources>

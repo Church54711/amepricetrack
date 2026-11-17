@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The mark in one colour, for launchers that tint icons to the wallpaper. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.234375"
+        android:scaleY="0.234375"
+        android:translateX="24"
+        android:translateY="24">
+        <path
+            android:pathData="M56,12H170L244,86V200a44,44 0,0 1,-44 44H56a44,44 0,0 1,-44 -44V56a44,44 0,0 1,44 -44Z"
+            android:strokeColor="#FFFFFF"
+            android:strokeLineJoin="round"
+            android:strokeWidth="6" />
+        <path
+            android:pathData="M175,70a11,11 0,1 0,22 0a11,11 0,1 0,-22 0"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="6" />
+        <path
+            android:pathData="M58,204 122,60 186,204"
+            android:strokeColor="#FFFFFF"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:strokeWidth="26" />
+        <path
+            android:pathData="M86,140H112L132,168H170"
+            android:strokeColor="#FFFFFF"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:strokeWidth="13" />
+    </group>
+</vector>

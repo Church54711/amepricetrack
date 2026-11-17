@@ -83,6 +83,15 @@ struct State {
 /// Longest a single page may take from navigation to finished HTML.
 const PAGE_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// A cookie to give a store's site, such as the visitor's ZIP code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteCookie {
+    pub name: &'static str,
+    pub value: String,
+    /// The site it is for, with a leading dot: ".example.com".
+    pub domain: &'static str,
+}
+
 impl Browser {
     pub fn new(exe: PathBuf, profile_dir: PathBuf, port: u16, extra_args: Vec<String>) -> Self {
         Browser {
@@ -338,6 +347,51 @@ impl Browser {
 
     /// Opens `url` in a new tab, waits for the page to finish, and returns its HTML.
     pub async fn fetch_html(&self, url: &str) -> Result<String> {
+        Ok(self.fetch_page(url, &[]).await?.0)
+    }
+
+    /// The same, and also the named cookies the site keeps for that page
+    /// (name, value), such as the local store it chose for the visitor.
+    pub async fn fetch_page(&self, url: &str, cookies: &[&str]) -> Result<(String, Vec<(String, String)>)> {
+        self.in_tab(|ws_url| async move { load_page(&ws_url, url, cookies).await }).await
+    }
+
+    /// Gives sites the cookies in `set`, and makes them forget the ones in
+    /// `forget` (cookie name, the site's address). Kept in the browser's profile.
+    pub async fn place_cookies(&self, set: &[SiteCookie], forget: &[(&str, &str)]) -> Result<()> {
+        self.in_tab(|ws_url| async move {
+            let (mut ws, _) =
+                tokio_tungstenite::connect_async(ws_url.as_str()).await.context("could not connect to the browser tab")?;
+            let mut id = 0u64;
+            for (name, site) in forget {
+                call(&mut ws, &mut id, "Network.deleteCookies", json!({ "name": name, "url": site })).await?;
+            }
+            let a_year_on = (std::time::SystemTime::now() + Duration::from_secs(365 * 86_400))
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for cookie in set {
+                let params = json!({
+                    "name": cookie.name, "value": cookie.value, "domain": cookie.domain,
+                    "path": "/", "secure": true, "expires": a_year_on,
+                });
+                let done = call(&mut ws, &mut id, "Network.setCookie", params).await?;
+                if done["success"].as_bool() == Some(false) {
+                    bail!("the browser would not keep the {} cookie", cookie.name);
+                }
+            }
+            let _ = ws.close(None).await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Opens an empty tab, runs `work` on its control channel, and closes the tab.
+    async fn in_tab<T, F, Fut>(&self, work: F) -> Result<T>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         // A person using the browser by hand comes first: their tab has to stay in front.
         let asked = Instant::now();
         while self.in_hands().await {
@@ -365,7 +419,7 @@ impl Browser {
             .ok_or_else(|| anyhow!("the browser did not offer a control channel"))?
             .to_string();
 
-        let result = tokio::time::timeout(PAGE_TIMEOUT, load_page(&ws_url, url)).await;
+        let result = tokio::time::timeout(PAGE_TIMEOUT, work(ws_url)).await;
 
         // Always close the tab, even when loading failed.
         let _ = self.http.get(self.endpoint(&format!("/json/close/{tab_id}"))).send().await;
@@ -434,7 +488,7 @@ async fn evaluate(ws: &mut Socket, next_id: &mut u64, expression: &str) -> Resul
     Ok(result["result"]["value"].clone())
 }
 
-async fn load_page(ws_url: &str, url: &str) -> Result<String> {
+async fn load_page(ws_url: &str, url: &str, cookies: &[&str]) -> Result<(String, Vec<(String, String)>)> {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.context("could not connect to the browser tab")?;
     let mut id = 0u64;
     call(&mut ws, &mut id, "Page.enable", json!({})).await?;
@@ -478,16 +532,36 @@ async fn load_page(ws_url: &str, url: &str) -> Result<String> {
     // The address and the page are taken in one look at the document, so they belong together.
     const SNAPSHOT: &str = "JSON.stringify({ at: location.href, html: document.documentElement.outerHTML })";
     let snapshot = evaluate(&mut ws, &mut id, SNAPSHOT).await;
-    let _ = ws.close(None).await;
-    let snapshot: Value = snapshot?.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let snapshot: Value = match snapshot {
+        Ok(found) => found.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null),
+        Err(e) => {
+            let _ = ws.close(None).await;
+            return Err(e);
+        }
+    };
     let address = snapshot["at"].as_str().unwrap_or_default();
+    let mut kept = Vec::new();
+    if !cookies.is_empty() && address.starts_with("http") {
+        // Best effort: a page is still worth reading when its cookies cannot be.
+        if let Ok(found) = call(&mut ws, &mut id, "Network.getCookies", json!({ "urls": [address] })).await {
+            for cookie in found["cookies"].as_array().into_iter().flatten() {
+                if let (Some(name), Some(value)) = (cookie["name"].as_str(), cookie["value"].as_str()) {
+                    if cookies.contains(&name) {
+                        kept.push((name.to_string(), value.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    let _ = ws.close(None).await;
     // The browser's own error pages have no web address and are read as they are (they say what went wrong).
     if address.is_empty() || (address.starts_with("http") && !crate::net::resolves_public(address).await) {
         bail!("the page led to an address that is not on the public internet");
     }
-    snapshot["html"]
+    let html = snapshot["html"]
         .as_str()
         .map(str::to_string)
         .filter(|h| !h.is_empty())
-        .ok_or_else(|| anyhow!("the browser returned an empty page"))
+        .ok_or_else(|| anyhow!("the browser returned an empty page"))?;
+    Ok((html, kept))
 }

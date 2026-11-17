@@ -22,6 +22,11 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.SelectableDates
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -43,6 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,6 +62,11 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import app.amepricetrack.App
 import app.amepricetrack.data.OtherStore
+import app.amepricetrack.data.buyByFromPicker
+import app.amepricetrack.data.buyByText
+import app.amepricetrack.data.chartPoints
+import app.amepricetrack.data.chartRanges
+import app.amepricetrack.data.pickerMillis
 import app.amepricetrack.data.PricePoint
 import app.amepricetrack.data.ProductDetail
 import app.amepricetrack.data.WatchSettings
@@ -164,6 +175,9 @@ fun ProductScreen(app: App, productId: Long, onBack: () -> Unit, onRemoved: () -
                         Badges(item)
                         item.deal.usualCents?.let { Muted("Usual price over 90 days: ${dollars(it)}") }
                         item.product.lowestPriceCents?.let { Muted("Lowest recorded: ${dollars(it)}") }
+                        item.product.pickup?.let { there ->
+                            Muted(if (there) "At your store: ready to collect today." else "At your store: not on the shelf; delivery only.")
+                        }
                         item.product.lastSuccessAt?.let { Muted("Last checked ${ago(it)}") }
                         OutlinedButton(onClick = {
                             runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(item.product.url))) }
@@ -224,8 +238,21 @@ fun ProductScreen(app: App, productId: Long, onBack: () -> Unit, onRemoved: () -
 /** The public price over time as a stepped line: a price holds until it changes. */
 @Composable
 private fun PriceChart(history: List<PricePoint>) {
-    val points = history.filter { !it.member }.sortedBy { it.ts }
-    if (points.size < 2) {
+    val now = System.currentTimeMillis() / 1000
+    val oldest = history.filter { !it.member }.minOfOrNull { it.ts } ?: now
+    // A stretch of time is offered once the history reaches back further than it.
+    val offered = chartRanges.filter { (_, days) -> now - oldest > days * 86_400L }
+    var days by rememberSaveable { mutableStateOf<Int?>(null) }
+    if (offered.isNotEmpty()) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            (offered + ("All" to null)).forEach { (label, range) ->
+                FilterChip(selected = days == range, onClick = { days = range }, label = { Text(label) })
+            }
+        }
+    }
+    val since = days?.let { now - it * 86_400L }
+    val points = chartPoints(history, since)
+    if (points.isEmpty() || (points.size < 2 && since == null)) {
         Muted("Not enough price changes yet.")
         return
     }
@@ -233,8 +260,8 @@ private fun PriceChart(history: List<PricePoint>) {
     val grid = LocalPalette.current.border
     val low = points.minOf { it.priceCents }
     val high = points.maxOf { it.priceCents }
-    val start = points.first().ts
-    val end = maxOf(System.currentTimeMillis() / 1000, points.last().ts + 1)
+    val start = since ?: points.first().ts
+    val end = maxOf(now, points.last().ts + 1)
     Canvas(Modifier.fillMaxWidth().height(140.dp)) {
         val pad = 6.dp.toPx()
         val width = size.width - 2 * pad
@@ -336,6 +363,8 @@ private fun AlertSettingsCard(watch: WatchSettings, usualMinutes: Int, onSave: (
     var backInStock by remember(watch) { mutableStateOf(watch.notifyBackInStock) }
     var note by remember(watch) { mutableStateOf(watch.note.orEmpty()) }
     var checkMinutes by remember(watch) { mutableStateOf(watch.checkMinutes) }
+    var buyBy by remember(watch) { mutableStateOf(watch.buyBy) }
+    var choosingDay by remember { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
 
     Card {
@@ -370,6 +399,17 @@ private fun AlertSettingsCard(watch: WatchSettings, usualMinutes: Int, onSave: (
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        Text("I want to buy by", fontWeight = FontWeight.Medium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = { choosingDay = true }) {
+                Text(buyBy?.let { buyByText(it, System.currentTimeMillis() / 1000).removePrefix("Buy by ") } ?: "No day chosen")
+            }
+            if (buyBy != null) TextButton(onClick = { buyBy = null }) { Text("Clear") }
+        }
+        Muted(
+            "Optional. In the last week before that day every price drop is announced and the price is checked more often. " +
+                "You are reminded a few days ahead, the day before and on the day, with how the price compares.",
+        )
         Text("Check the price", fontWeight = FontWeight.Medium)
         val paces = listOf<Int?>(null) + paceChoices(usualMinutes, watch.checkMinutes)
         paces.forEach { pace ->
@@ -395,9 +435,30 @@ private fun AlertSettingsCard(watch: WatchSettings, usualMinutes: Int, onSave: (
                 else -> null
             }
             if (problem == null) {
-                onSave(WatchSettings(targetCents, dropPercent, anyDrop, backInStock, note.trim().ifEmpty { null }, checkMinutes))
+                onSave(WatchSettings(targetCents, dropPercent, anyDrop, backInStock, note.trim().ifEmpty { null }, checkMinutes, buyBy))
             }
         }) { Text("Save") }
+    }
+
+    if (choosingDay) {
+        // Today in UTC, as the picker counts days; earlier days cannot be chosen.
+        val today = System.currentTimeMillis() / 86_400_000L * 86_400_000L
+        val picker = rememberDatePickerState(
+            initialSelectedDateMillis = buyBy?.let(::pickerMillis),
+            selectableDates = object : SelectableDates {
+                override fun isSelectableDate(utcTimeMillis: Long) = utcTimeMillis >= today
+            },
+        )
+        DatePickerDialog(
+            onDismissRequest = { choosingDay = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    picker.selectedDateMillis?.let { buyBy = buyByFromPicker(it) }
+                    choosingDay = false
+                }) { Text("Choose") }
+            },
+            dismissButton = { TextButton(onClick = { choosingDay = false }) { Text("Cancel") } },
+        ) { DatePicker(state = picker) }
     }
 }
 

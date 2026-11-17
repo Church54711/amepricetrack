@@ -421,13 +421,46 @@ fn generic(html: &str) -> Observation {
 static RE_STAPLES_LIST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""listPrice":([0-9.]+)"#).unwrap());
 static RE_STAPLES_FINAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""finalPrice":([0-9.]+)"#).unwrap());
 
+static RE_STAPLES_IN_STORE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""isInstoreInstock":(true|false)"#).unwrap());
+
 fn staples(html: &str) -> Observation {
     let mut obs = generic(html);
     if obs.price_cents.is_none() {
         obs.price_cents = first_capture(&RE_STAPLES_FINAL, html).and_then(|s| money_str(&s));
     }
     obs.list_price_cents = first_capture(&RE_STAPLES_LIST, html).and_then(|s| money_str(&s));
+    // Whether the store Staples has chosen for the visitor has it on the shelf.
+    obs.pickup = first_capture(&RE_STAPLES_IN_STORE, html).map(|s| s == "true");
     obs
+}
+
+/// The store Staples chose for the visitor, from its "YourStore" cookie.
+pub fn staples_store(cookie: &str) -> Option<LocalStore> {
+    let decoded: String = url::form_urlencoded::parse(format!("v={cookie}").as_bytes()).next()?.1.into_owned();
+    let store: Value = serde_json::from_str(&decoded).ok()?;
+    let part = |key: &str| store.get(key).and_then(text).unwrap_or_default();
+    let id = part("storeNumber");
+    let town = [part("city"), part("state")].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(", ");
+    (!id.is_empty()).then(|| LocalStore { id, place: format!("{town} {}", part("zipCode")).trim().to_string() })
+}
+
+static RE_BBY_PICKUP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""ispuAvailability":\[\{"pickupEligible":(true|false),"instoreInventoryAvailable":(true|false)"#).unwrap()
+});
+static RE_BBY_SKU_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""skuId":"(\d{5,10})""#).unwrap());
+
+/// Whether the Best Buy store chosen for the visitor has this item to collect.
+/// The page describes many items; each answer belongs to the item named last before it.
+pub fn bestbuy_pickup(html: &str, sku: &str) -> Option<bool> {
+    RE_BBY_PICKUP.captures_iter(html).find_map(|found| {
+        let at = found.get(0)?.start();
+        let mut from = at.saturating_sub(4000);
+        while !html.is_char_boundary(from) {
+            from += 1;
+        }
+        let owner = RE_BBY_SKU_ID.captures_iter(&html[from..at]).last()?;
+        (&owner[1] == sku).then(|| &found[1] == "true" && &found[2] == "true")
+    })
 }
 
 static RE_BBY_PRICE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""customerPrice":([0-9.]+)"#).unwrap());
@@ -526,6 +559,7 @@ fn walmart(html: &str) -> Observation {
         store_ships,
         ships_free,
         shipping_cents: stated_charge.filter(|cents| *cents > 0),
+        pickup: None,
     }
 }
 
@@ -701,12 +735,54 @@ fn amazon(html: &str) -> Observation {
         store_ships,
         ships_free,
         shipping_cents,
+        pickup: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staples_says_whether_the_local_store_has_it() {
+        let page = |in_store: &str| {
+            format!(
+                r#"<script type="application/ld+json">{{"@type":"Product","name":"Paper","offers":{{"price":"62.79"}}}}</script>
+                <script>{{"price":"$62.79","pickupMessage":"30-min pickup","isInstoreInstock":{in_store},"listPrice":62.79}}</script>"#
+            )
+        };
+        assert_eq!(parse("staples", &page("true")).unwrap().pickup, Some(true));
+        assert_eq!(parse("staples", &page("false")).unwrap().pickup, Some(false));
+        let silent =
+            r#"<script type="application/ld+json">{"@type":"Product","name":"Paper","offers":{"price":"62.79"}}</script>"#;
+        assert_eq!(parse("staples", silent).unwrap().pickup, None);
+    }
+
+    #[test]
+    fn the_staples_store_is_read_from_its_cookie() {
+        let cookie = "%7B%22address1%22%3A%221%20Main%20St.%22%2C%22city%22%3A%22Springfield%22%2C%22state%22%3A%22IL%22%2C\
+                      %22zipCode%22%3A%2262704%22%2C%22storeNumber%22%3A%221234%22%2C%22persists%22%3Atrue%7D";
+        assert_eq!(staples_store(cookie), Some(LocalStore { id: "1234".into(), place: "Springfield, IL 62704".into() }));
+        assert_eq!(staples_store("%7B%22city%22%3A%22Springfield%22%7D"), None, "no store number");
+        assert_eq!(staples_store("not json"), None);
+        assert_eq!(staples_store(""), None);
+    }
+
+    #[test]
+    fn best_buy_pickup_belongs_to_the_item_named_before_it() {
+        let answer = |sku: &str, eligible: bool, on_shelf: bool| {
+            format!(
+                r#"{{"skuId":"{sku}","name":"x","fulfillmentOptions":{{"ispuDetails":[{{"ispuAvailability":[{{"pickupEligible":{eligible},"instoreInventoryAvailable":{on_shelf},"quantity":null}}]}}]}}}}"#
+            )
+        };
+        let page =
+            format!("{}{}{}", answer("1111111", false, false), answer("2222222", true, true), answer("3333333", true, false));
+        assert_eq!(bestbuy_pickup(&page, "1111111"), Some(false));
+        assert_eq!(bestbuy_pickup(&page, "2222222"), Some(true));
+        assert_eq!(bestbuy_pickup(&page, "3333333"), Some(false), "eligible but not on the shelf");
+        assert_eq!(bestbuy_pickup(&page, "4444444"), None, "the page does not speak of this item");
+        assert_eq!(bestbuy_pickup("<html></html>", "1111111"), None);
+    }
 
     fn fixture(name: &str) -> String {
         let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));

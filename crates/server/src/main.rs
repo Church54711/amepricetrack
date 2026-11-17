@@ -15,6 +15,7 @@ mod db;
 mod fetch;
 mod find;
 mod health;
+mod history;
 mod net;
 mod pricing;
 mod retailers;
@@ -22,6 +23,7 @@ mod scheduler;
 mod service;
 mod stores;
 mod ui;
+mod update;
 mod web;
 
 use axum::extract::DefaultBodyLimit;
@@ -54,6 +56,12 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_env("APT_LOG").unwrap_or_else(|_| "info,sqlx=warn,html5ever=error".into()),
         )
         .init();
+
+    // `amepricetrack version` prints the version and nothing else.
+    if matches!(std::env::args().nth(1).as_deref(), Some("version" | "--version" | "-V")) {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     let cfg = config::Config::from_env()?;
 
@@ -367,6 +375,8 @@ pub async fn test_app() -> App {
         backup_keep: 0,
         backup_dir: std::env::temp_dir().join("apt-test-backups"),
         members_local_network: false,
+        update_check: false,
+        update_request: None,
     };
     Arc::new(AppState {
         db: db::open_in_memory().await,

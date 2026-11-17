@@ -1,0 +1,11 @@
+[Unit]
+Description=Update AmePriceTrack to the latest release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root, because it replaces the program. It takes nothing from the
+# website but the request itself: the release always comes from the project's
+# own download page and is checked against its checksum.
+ExecStart=/usr/local/sbin/amepricetrack-update --requested

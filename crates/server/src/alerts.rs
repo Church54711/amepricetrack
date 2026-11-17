@@ -17,7 +17,7 @@ pub struct Alert {
 ///
 /// Returns the alert to send (if any). The caller stores `view.your_cents`
 /// as the new "last seen" price afterwards.
-pub fn decide(watch: &Watch, product: &Product, view: &PriceView) -> Option<Alert> {
+pub fn decide(watch: &Watch, product: &Product, view: &PriceView, now: i64) -> Option<Alert> {
     let came_back = watch.notify_back_in_stock && watch.last_seen_in_stock == Some(false) && product.in_stock == Some(true);
 
     let Some(now_price) = view.your_cents else {
@@ -38,7 +38,20 @@ pub fn decide(watch: &Watch, product: &Product, view: &PriceView) -> Option<Aler
 
     if let Some(before) = before.filter(|b| now_price < *b) {
         let percent = (before - now_price) as f64 / before as f64 * 100.0;
-        // 2. A drop of at least the chosen size.
+        // 2. With the buy-by day a week away or less, every drop counts, whatever
+        //    minimum was chosen: there is little time left to wait for a bigger one.
+        if let Some(days) = watch.buy_by.map(|day| db::days_until(day, now)).filter(|d| (0..=7).contains(d)) {
+            let left = match days {
+                0 => "today is your buy-by day".to_string(),
+                1 => "your buy-by day is tomorrow".to_string(),
+                n => format!("{n} days to your buy-by day"),
+            };
+            return Some(Alert {
+                kind: "drop",
+                headline: format!("Price drop: {} \u{2192} {} ({left})", dollars(before), dollars(now_price)),
+            });
+        }
+        // 3. A drop of at least the chosen size.
         if let Some(wanted) = watch.drop_percent.filter(|w| *w > 0.0) {
             if percent >= wanted {
                 return Some(Alert {
@@ -47,7 +60,7 @@ pub fn decide(watch: &Watch, product: &Product, view: &PriceView) -> Option<Aler
                 });
             }
         } else if watch.notify_any_drop {
-            // 3. Any drop at all (only when no minimum size was chosen).
+            // 4. Any drop at all (only when no minimum size was chosen).
             return Some(Alert {
                 kind: "drop",
                 headline: format!("Price drop: {} \u{2192} {}", dollars(before), dollars(now_price)),
@@ -67,7 +80,7 @@ pub async fn evaluate(app: &crate::App, product_id: i64) -> Result<()> {
         let rules = db::rules(&app.db, watch.user_id).await?;
         let member = db::member_prices(&app.db, watch.user_id).await?.get(&product_id).copied();
         let view = pricing::view(&product, member, &rules);
-        let alert = decide(&watch, &product, &view);
+        let alert = decide(&watch, &product, &view, db::now());
 
         // Remember what this person has now been shown. When the price climbs
         // back above the target, forget the last target alert so the next dip
@@ -167,6 +180,78 @@ pub async fn notify(
     Ok(())
 }
 
+/// A short date for a sentence: "Nov 28".
+fn short_date(ts: i64) -> String {
+    let format = time::macros::format_description!("[month repr:short] [day padding:none]");
+    time::OffsetDateTime::from_unix_timestamp(ts).ok().and_then(|d| d.format(format).ok()).unwrap_or_default()
+}
+
+/// What to say as a buy-by day comes close: the price now, how it compares
+/// with the past, and whether another store is cheaper.
+pub fn buy_by_reminder(view: &crate::service::WatchView, stage: i64, now: i64) -> Option<(String, String)> {
+    let day = view.watch.buy_by?;
+    let store = retailers::display_name(&view.product.retailer);
+    let when = match stage {
+        3 => "today".to_string(),
+        2 => "tomorrow".to_string(),
+        1 => format!("in {} days", db::days_until(day, now).max(2)),
+        _ => return None,
+    };
+    let title = format!("Buy by {}: that is {when}", short_date(day));
+    let mut body = view.product.display_title();
+    match view.price.your_cents {
+        Some(price) => {
+            body.push_str(&format!("\n{} at {store} now.", dollars(price)));
+            match (view.product.lowest_price_cents, view.product.lowest_price_at) {
+                (Some(low), _) if view.product.current_price_cents.is_some_and(|current| current <= low) => {
+                    body.push_str(" That is the lowest price recorded.");
+                }
+                (Some(low), Some(at)) => {
+                    body.push_str(&format!(" The lowest recorded was {} on {}.", dollars(low), short_date(at)))
+                }
+                _ => {}
+            }
+            if let Some(other) = view.elsewhere.as_ref().filter(|other| other.cents < price) {
+                body.push_str(&format!("\nCheaper at {}: {}.", other.store_name, dollars(other.cents)));
+            }
+        }
+        None => body.push_str(&format!("\nNo price has been read at {store} yet.")),
+    }
+    if view.product.in_stock == Some(false) {
+        body.push_str("\nIt is out of stock right now.");
+    }
+    Some((title, body))
+}
+
+/// Sends the reminders that are due for buy-by days coming close. Each
+/// stage (a few days ahead, the day before, the day itself) is sent once.
+pub async fn buy_by_reminders(app: &crate::App) -> Result<()> {
+    let now = db::now();
+    let due: Vec<Watch> =
+        sqlx::query_as("SELECT * FROM watches WHERE buy_by IS NOT NULL AND buy_by_told < 4").fetch_all(&app.db).await?;
+    for watch in due {
+        let Some(day) = watch.buy_by else { continue };
+        let stage = db::buy_by_stage(day, now);
+        if stage <= watch.buy_by_told {
+            continue;
+        }
+        sqlx::query("UPDATE watches SET buy_by_told = ? WHERE id = ?").bind(stage).bind(watch.id).execute(&app.db).await?;
+        let view = match crate::service::watch_view(app, watch.user_id, watch.product_id).await {
+            Ok(Some(view)) => view,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("could not prepare a buy-by reminder: {e}");
+                continue;
+            }
+        };
+        if let Some((title, body)) = buy_by_reminder(&view, stage, now) {
+            notify(app, watch.user_id, Some(watch.product_id), "buy_by", &title, &body, view.price.your_cents, &view.product.url)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// The address that opens a product in the phone app.
 pub fn app_link(product_id: i64) -> String {
     format!("amepricetrack://products/{product_id}")
@@ -262,6 +347,7 @@ mod tests {
             ships_free: None,
             shipping_cents: None,
             server_read_ok: None,
+            pickup: None,
         }
     }
 
@@ -281,12 +367,43 @@ mod tests {
             last_alert_price_cents: None,
             last_alert_at: None,
             check_minutes: None,
+            buy_by: None,
+            buy_by_told: 0,
         }
     }
 
+    const NOW: i64 = 1_795_000_000;
+
     fn check(w: &Watch, price: i64) -> Option<Alert> {
         let p = product(Some(price), Some(true));
-        decide(w, &p, &pricing::view(&p, None, &[]))
+        decide(w, &p, &pricing::view(&p, None, &[]), NOW)
+    }
+
+    #[test]
+    fn a_near_buy_by_day_makes_every_drop_count() {
+        // A 5% drop, with only drops of 20% or more asked for.
+        let patient = Watch { drop_percent: Some(20.0), last_seen_price_cents: Some(10000), ..watch() };
+        assert_eq!(check(&patient, 9500), None);
+        let in_three_days = Watch { buy_by: Some(NOW + 3 * db::DAY), ..patient.clone() };
+        let alert = check(&in_three_days, 9500).unwrap();
+        assert_eq!(alert.kind, "drop");
+        assert!(alert.headline.contains("3 days to your buy-by day"), "{}", alert.headline);
+        // A month away, or already past, changes nothing.
+        assert_eq!(check(&Watch { buy_by: Some(NOW + 30 * db::DAY), ..patient.clone() }, 9500), None);
+        assert_eq!(check(&Watch { buy_by: Some(NOW - 3 * db::DAY), ..patient.clone() }, 9500), None);
+        // A rise is still not news.
+        assert_eq!(check(&in_three_days, 10500), None);
+    }
+
+    #[test]
+    fn the_buy_by_day_is_counted_in_whole_days() {
+        let noon = 1_795_003_200 - 1_795_003_200 % db::DAY + db::DAY / 2;
+        assert_eq!(db::days_until(noon, noon), 0);
+        assert_eq!(db::days_until(noon, noon - db::DAY / 2 + 60), 0, "early that day");
+        assert_eq!(db::days_until(noon, noon + db::DAY / 2 - 60), 0, "late that day");
+        assert_eq!(db::days_until(noon, noon - db::DAY), 1);
+        assert_eq!(db::days_until(noon, noon + db::DAY), -1);
+        assert_eq!([4, 3, 2, 1, 1, 0].to_vec(), [-1, 0, 1, 2, 3, 4].map(|d| db::buy_by_stage(noon, noon - d * db::DAY)).to_vec());
     }
 
     #[test]
@@ -340,8 +457,8 @@ mod tests {
             created_at: 0,
             free_shipping: false,
         };
-        assert_eq!(decide(&w, &p, &pricing::view(&p, None, &[])), None);
-        let alert = decide(&w, &p, &pricing::view(&p, None, &[rule])).unwrap();
+        assert_eq!(decide(&w, &p, &pricing::view(&p, None, &[]), NOW), None);
+        let alert = decide(&w, &p, &pricing::view(&p, None, &[rule]), NOW).unwrap();
         assert_eq!(alert.headline, "Hit your target: now $90.00 (target $92.00)");
     }
 
@@ -401,8 +518,8 @@ mod tests {
         let w =
             Watch { notify_back_in_stock: true, last_seen_in_stock: Some(false), last_seen_price_cents: Some(5000), ..watch() };
         let p = product(Some(5000), Some(true));
-        assert_eq!(decide(&w, &p, &pricing::view(&p, None, &[])).unwrap().kind, "stock");
+        assert_eq!(decide(&w, &p, &pricing::view(&p, None, &[]), NOW).unwrap().kind, "stock");
         let off = Watch { notify_back_in_stock: false, ..w };
-        assert_eq!(decide(&off, &p, &pricing::view(&p, None, &[])), None);
+        assert_eq!(decide(&off, &p, &pricing::view(&p, None, &[]), NOW), None);
     }
 }

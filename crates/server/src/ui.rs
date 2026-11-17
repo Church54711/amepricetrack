@@ -9,7 +9,7 @@ use time::macros::format_description;
 
 pub const CSS: &str = include_str!("../static/app.css");
 pub const JS: &str = include_str!("../static/app.js");
-pub const ICON: &str = include_str!("../../../assets/icon.svg");
+pub const ICON: &str = include_str!("../../../assets/logo-mark.svg");
 
 /// Changes whenever the stylesheet or script changes, so a browser never
 /// keeps using an old copy after the server is updated.
@@ -276,8 +276,43 @@ pub fn badges(v: &WatchView) -> Markup {
     }
 }
 
+/// The stretches of time a chart can show: (what the link says, its name in the address, days).
+pub const CHART_RANGES: &[(&str, &str, i64)] = &[("1 month", "30", 30), ("3 months", "90", 90), ("1 year", "365", 365)];
+
+/// The points to draw for the time since `since`: those inside it, and the
+/// price that already held when it began.
+fn in_range(points: &[PricePoint], since: i64) -> Vec<PricePoint> {
+    let mut shown: Vec<PricePoint> = Vec::new();
+    for member in [false, true] {
+        let mut held: Option<PricePoint> = None;
+        for p in points.iter().filter(|p| p.member == member) {
+            if p.ts < since {
+                held = Some(PricePoint { ts: since, ..p.clone() });
+            } else {
+                shown.extend(held.take());
+                shown.push(p.clone());
+            }
+        }
+        // Nothing changed inside the range: the price that held is still the price.
+        if !member {
+            shown.extend(held);
+        }
+    }
+    shown.sort_by_key(|p| p.ts);
+    shown
+}
+
 /// Price history as a stepped line: a price holds until the next change.
-pub fn chart(points: &[PricePoint], target_cents: Option<i64>, now: i64) -> Markup {
+/// `since` leaves out everything before that time.
+pub fn chart(points: &[PricePoint], target_cents: Option<i64>, now: i64, since: Option<i64>) -> Markup {
+    let ranged;
+    let points = match since {
+        Some(since) => {
+            ranged = in_range(points, since);
+            &ranged[..]
+        }
+        None => points,
+    };
     let public: Vec<&PricePoint> = points.iter().filter(|p| !p.member).collect();
     let member: Vec<&PricePoint> = points.iter().filter(|p| p.member).collect();
     let Some(first) = points.iter().map(|p| p.ts).min() else {

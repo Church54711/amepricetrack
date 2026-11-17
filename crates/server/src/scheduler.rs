@@ -39,6 +39,14 @@ pub async fn run(app: App) {
             if let Err(e) = crate::backup::daily(&app).await {
                 tracing::warn!("could not look after the backups: {e:#}");
             }
+            // Remind people whose buy-by day is coming close.
+            if let Err(e) = alerts::buy_by_reminders(&app).await {
+                tracing::warn!("could not send buy-by reminders: {e:#}");
+            }
+            // Tell the administrator when a newer version has been published.
+            if let Err(e) = crate::update::daily(&app).await {
+                tracing::warn!("could not look for a newer version: {e:#}");
+            }
         }
 
         // Sleep until something is due, or until someone adds a product or presses "check now".

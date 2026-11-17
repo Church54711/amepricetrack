@@ -25,6 +25,10 @@ pub fn routes() -> Router<App> {
         .route("/watches", post(add_watch))
         .route("/products/{id}", get(product_page))
         .route("/products/{id}/watch", post(update_watch))
+        .route("/products/{id}/history.csv", get(history_csv))
+        .route("/products/{id}/history", post(import_history))
+        .route("/products/{id}/history/keepa", post(import_keepa))
+        .route("/settings/keepa", post(save_keepa))
         .route("/products/{id}/check", post(check_now))
         .route("/products/{id}/remove", post(remove_watch))
         .route("/products/{id}/compare", post(compare_now))
@@ -64,6 +68,8 @@ pub fn routes() -> Router<App> {
         .route("/settings/users", post(add_user))
         .route("/settings/users/{id}/remove", post(remove_user))
         .route("/settings/backup", post(backup_now))
+        .route("/settings/update", post(update_now))
+        .route("/settings/update/check", post(update_check))
         .route("/static/app.css", get(|| async { asset("text/css; charset=utf-8", ui::CSS) }))
         .route("/static/app.js", get(|| async { asset("text/javascript; charset=utf-8", ui::JS) }))
         .route("/favicon.svg", get(|| async { asset("image/svg+xml", ui::icon().0) }))
@@ -170,6 +176,8 @@ struct PageQuery {
     msg: Option<String>,
     err: Option<String>,
     store: Option<String>,
+    /// How much of a price chart to show: 30, 90 or 365 days; anything else is all of it.
+    range: Option<String>,
 }
 
 impl PageQuery {
@@ -368,6 +376,23 @@ fn browser_notice(app: &App, views: &[WatchView]) -> Option<Markup> {
     })
 }
 
+/// "Buy by Nov 28", highlighted when the day is close.
+fn buy_by_tag(day: i64, now: i64) -> Markup {
+    let left = db::days_until(day, now);
+    html! {
+        span.tag.warn[(0..=3).contains(&left)] {
+            "Buy by " (ui::when(day, true))
+            @match left {
+                0 => { " (today)" }
+                1 => { " (tomorrow)" }
+                2..=7 => { " (" (left) " days)" }
+                d if d < 0 => { " (passed)" }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn item_row(v: &WatchView, now: i64) -> Markup {
     let p = &v.product;
     html! {
@@ -380,6 +405,7 @@ fn item_row(v: &WatchView, now: i64) -> Markup {
                     (ui::badges(v))
                     @if let Some(target) = v.watch.target_price_cents { span { "Target " (dollars(target)) } }
                     @if let Some(minutes) = v.watch.check_minutes { span { "Watched closely: every " (interval_text(minutes as u64)) } }
+                    @if let Some(day) = v.watch.buy_by { (buy_by_tag(day, now)) }
                     @if let Some(checked) = p.last_success_at { span { "Checked " (ui::ago(now, checked)) } }
                 }
             }
@@ -614,13 +640,19 @@ async fn product_page(
     let now = db::now();
     let history = db::history(&app.db, id, user.id).await?;
     let stores = crate::compare::tracking::for_product(&app.db, user.id, id).await?;
-    let ignore_marketplace = db::settings(&app.db, user.id).await?.ignore_marketplace;
     let personal = v.price.is_personal();
     let store = ui::store_name(&p.retailer);
     let last_source = history.iter().rev().find(|h| !h.member).map(|h| h.source.as_str());
     let pending = p.current_price_cents.is_none() && p.last_error.is_none() && v.price.your_cents.is_none();
     let usual_minutes = (app.cfg.check_interval.as_secs() / 60) as i64;
     let paces = pace_choices(usual_minutes, v.watch.check_minutes);
+    // The chart's range, offered once the history is long enough for it to matter.
+    let range = ui::CHART_RANGES.iter().find(|(_, name, _)| q.range.as_deref() == Some(name));
+    let since = range.map(|(_, _, days)| now - days * db::DAY);
+    let oldest = history.iter().map(|h| h.ts).min().unwrap_or(now);
+    let offered: Vec<_> = ui::CHART_RANGES.iter().filter(|(_, _, days)| now - oldest > days * db::DAY).collect();
+    let settings = db::settings(&app.db, user.id).await?;
+    let imported = history.iter().filter(|h| h.source == "import").count();
 
     let body = html! {
         p.small { a href="/" { "\u{2190} Watchlist" } }
@@ -680,9 +712,19 @@ async fn product_page(
             div {
                 div.card {
                     h2 { "Price history" }
-                    (ui::chart(&history, v.watch.target_price_cents, now))
+                    @if !offered.is_empty() {
+                        p.small.ranges {
+                            @for (label, name, _) in &offered {
+                                @if range.is_some_and(|(_, shown, _)| shown == name) { strong { (label) } }
+                                @else { a href={ "/products/" (id) "?range=" (name) } { (label) } }
+                                " \u{b7} "
+                            }
+                            @if range.is_none() { strong { "All" } } @else { a href={ "/products/" (id) } { "All" } }
+                        }
+                    }
+                    (ui::chart(&history, v.watch.target_price_cents, now, since))
                 }
-                (other_stores_card(&v, &stores, ignore_marketplace))
+                (other_stores_card(&v, &stores, settings.ignore_marketplace))
                 @if !history.is_empty() {
                     div.card {
                         h2 { "Recorded changes" }
@@ -693,12 +735,41 @@ async fn product_page(
                                     tr {
                                         td { (ui::when(h.ts, false)) }
                                         td.num { (dollars(h.price_cents)) }
-                                        td { @if h.member { "Signed-in" } @else { "Listed" } }
+                                        td { @if h.member { "Signed-in" } @else if h.source == "import" { "Added later" } @else { "Listed" } }
                                         td { @match h.in_stock { Some(true) => { "In stock" } Some(false) => { "Out of stock" } None => { "" } } }
                                     }
                                 }
                             }
                         } }
+                        p.small { a href={ "/products/" (id) "/history.csv" } { "Download all " (history.len()) " as a spreadsheet (CSV)" } }
+                    }
+                }
+                div.card #past {
+                    h2 { "Prices from before" }
+                    p.muted {
+                        "Tracking starts with an empty history. Prices from before can be added here, so the chart, "
+                        "the average and the lowest price have something to go on."
+                        @if imported > 0 { " " (imported) " added so far; adding again replaces them." }
+                    }
+                    @if p.retailer == "amazon" {
+                        @if settings.keepa_key.is_empty() {
+                            p.small { "For Amazon, Keepa has the history. With a Keepa key on the " a href="/settings#keepa" { "Settings page" } ", one button fetches it." }
+                        } @else {
+                            form method="post" action={ "/products/" (id) "/history/keepa" } data-once {
+                                button.secondary type="submit" data-busy="Asking Keepa\u{2026}" { "Get Amazon's past prices from Keepa" }
+                            }
+                        }
+                    }
+                    details {
+                        summary { "Paste dates and prices" }
+                        form method="post" action={ "/products/" (id) "/history" } {
+                            div.field {
+                                label for="prices" { "One date and price per line" }
+                                textarea #prices name="prices" rows="6" required placeholder="2025-03-01, 19.99\n2025-06-14, 17.49" {}
+                                div.hint { "Copied from a spreadsheet works too, and so does a file downloaded above. Only prices from before tracking started here are kept." }
+                            }
+                            button.secondary type="submit" { "Add" }
+                        }
                     }
                 }
             }
@@ -728,6 +799,14 @@ async fn product_page(
                         div.field {
                             label for="note" { "Note" }
                             input #note type="text" name="note" maxlength="200" value=[v.watch.note.as_deref()];
+                        }
+                        div.field {
+                            label for="buy_by" { "I want to buy by" }
+                            input #buy_by type="date" name="buy_by" value=[v.watch.buy_by.map(service::day_text)];
+                            div.hint {
+                                "Optional. In the last week before that day every price drop is announced and the price is checked more often; "
+                                "you are reminded a few days ahead, the day before and on the day, with how the price compares."
+                            }
                         }
                         div.field {
                             label for="check_minutes" { "Check the price" }
@@ -761,6 +840,10 @@ async fn product_page(
                             dt { "Lowest recorded" } dd { (dollars(low)) " on " (ui::when(at, true)) }
                         }
                         @if let Some(stock) = p.in_stock { dt { "Stock" } dd { @if stock { "In stock" } @else { "Out of stock" } } }
+                        @if let Some(pickup) = p.pickup {
+                            dt { "At your store" }
+                            dd { @if pickup { "Ready to collect today" } @else { "Not on the shelf; delivery only" } }
+                        }
                         @if let Some(seller) = &p.seller { dt { "Sold by" } dd { (seller) } }
                         @match (v.price.shipping_cents, v.price.shipping_extra) {
                             (Some(0), _) => { dt { "Delivery" } dd { "Free" } }
@@ -802,6 +885,8 @@ struct WatchForm {
     note: String,
     #[serde(default)]
     check_minutes: String,
+    #[serde(default)]
+    buy_by: String,
 }
 
 /// The paces a person can pick for one product, in minutes: the ones
@@ -822,8 +907,20 @@ async fn update_watch(
     Form(form): Form<WatchForm>,
 ) -> WebResult {
     let page = format!("/products/{id}");
+    let buy_by = match service::buy_by_day(&form.buy_by) {
+        Ok(day) => day,
+        // A day that has passed stays as it is when something else on the form is saved.
+        Err(_)
+            if db::watch(&app.db, user.id, id).await?.and_then(|w| w.buy_by).map(service::day_text).as_deref()
+                == Some(form.buy_by.trim()) =>
+        {
+            db::watch(&app.db, user.id, id).await?.and_then(|w| w.buy_by)
+        }
+        Err(p) => return back(&page, p),
+    };
     let edit = match (optional_price(&form.target), optional_percent(&form.drop_percent)) {
         (Ok(target), Ok(drop)) => WatchEdit {
+            buy_by,
             target_price_cents: target,
             drop_percent: drop,
             notify_any_drop: checked(&form.any_drop),
@@ -840,6 +937,93 @@ async fn update_watch(
     // The new target may already be met.
     alerts::evaluate(&app, id).await?;
     Ok(go(&page, true, "Alert settings saved."))
+}
+
+/// The product's whole price history as a file a spreadsheet opens.
+async fn history_csv(State(app): State<App>, CurrentUser(user): CurrentUser, Path(id): Path<i64>) -> WebResult {
+    let Some(v) = service::watch_view(&app, user.id, id).await? else {
+        return Ok(not_found().await);
+    };
+    let csv = crate::history::to_csv(&db::history(&app.db, id, user.id).await?);
+    let name = crate::history::file_name(&v.product.display_title());
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+        ],
+        csv,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct PastPricesForm {
+    #[serde(default)]
+    prices: String,
+}
+
+fn added_text(count: usize) -> String {
+    format!(
+        "Added {count} past price{}. The chart, average and lowest price now include them.",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+async fn import_history(
+    State(app): State<App>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<i64>,
+    Form(form): Form<PastPricesForm>,
+) -> WebResult {
+    let page = format!("/products/{id}#past");
+    let points = match crate::history::parse_pasted(&form.prices, db::now()) {
+        Ok(points) => points,
+        Err(why) => return Ok(go(&page, false, &why)),
+    };
+    match crate::history::import(&app, user.id, id, points).await {
+        Ok(count) => Ok(go(&page, true, &added_text(count))),
+        Err(problem) => back(&page, problem),
+    }
+}
+
+async fn import_keepa(State(app): State<App>, CurrentUser(user): CurrentUser, Path(id): Path<i64>) -> WebResult {
+    let page = format!("/products/{id}#past");
+    let Some(v) = service::watch_view(&app, user.id, id).await? else {
+        return Ok(not_found().await);
+    };
+    let key = db::settings(&app.db, user.id).await?.keepa_key;
+    if v.product.retailer != "amazon" || key.is_empty() {
+        return Ok(go(&page, false, "Keepa only has Amazon products, and needs your Keepa key on the Settings page."));
+    }
+    let points = match crate::history::from_keepa(&app, &key, &v.product.retailer_sku).await {
+        Ok(points) => points,
+        Err(problem) => return back(&page, problem),
+    };
+    match crate::history::import(&app, user.id, id, points).await {
+        Ok(count) => Ok(go(&page, true, &added_text(count))),
+        Err(problem) => back(&page, problem),
+    }
+}
+
+#[derive(Deserialize)]
+struct KeepaForm {
+    #[serde(default)]
+    keepa_key: String,
+}
+
+async fn save_keepa(State(app): State<App>, CurrentUser(user): CurrentUser, Form(form): Form<KeepaForm>) -> WebResult {
+    let key = form.keepa_key.trim();
+    // An empty field keeps the saved key; the word "none" removes it.
+    let key = match key {
+        "" => return Ok(go("/settings#keepa", true, "Nothing changed.")),
+        "none" => "",
+        key if key.len() > 200 || !key.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            return Ok(go("/settings#keepa", false, "That does not look like a Keepa key: it is letters and numbers only."));
+        }
+        key => key,
+    };
+    sqlx::query("UPDATE user_settings SET keepa_key = ? WHERE user_id = ?").bind(key).bind(user.id).execute(&app.db).await?;
+    Ok(go("/settings#keepa", true, if key.is_empty() { "The Keepa key was removed." } else { "Keepa key saved." }))
 }
 
 async fn check_now(State(app): State<App>, CurrentUser(user): CurrentUser, Path(id): Path<i64>) -> WebResult {
@@ -1048,7 +1232,7 @@ fn find_results(answer: &crate::find::StoreAnswer) -> Markup {
 
 /// Looks a product up by name or barcode at every store, to pick one to track.
 async fn find_page(State(app): State<App>, CurrentUser(user): CurrentUser, Query(q): Query<FindQuery>) -> WebResult {
-    let flash = PageQuery { msg: q.msg.clone(), err: q.err.clone(), store: None }.flash();
+    let flash = PageQuery { msg: q.msg.clone(), err: q.err.clone(), ..Default::default() }.flash();
     let query = match crate::find::query(&q.q) {
         Ok(query) => query,
         Err(problem) => return back("/", problem),
@@ -1364,8 +1548,27 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
                         }
                     }
                 }
+                @for (chain, store) in [("Staples", &location.staples_store), ("Best Buy", &location.bestbuy_store)] {
+                    dt { (chain) }
+                    dd {
+                        @match store {
+                            Some(store) => {
+                                "Your store is number " strong { (store.id) }
+                                @if !store.place.is_empty() { " in " (store.place) }
+                                "."
+                            }
+                            None if !has_browser => { "Needs Chrome on the server." }
+                            None => { "The store is shown here after the next " (chain) " price check." }
+                        }
+                        div.hint {
+                            (chain) " charges one online price everywhere. The store decides what can be collected today, "
+                            "which each product's page here shows."
+                            @if location.zip.is_none() { " Without a ZIP code, " (chain) " picks the store from this server's internet connection." }
+                        }
+                    }
+                }
                 dt { "Other stores" }
-                dd.muted { "Staples, Best Buy, Amazon, Kohl's, Harbor Freight and Hot Topic show one online price everywhere." }
+                dd.muted { "Amazon, Kohl's, Harbor Freight and Hot Topic show one online price everywhere." }
             }
         }
 
@@ -1472,7 +1675,7 @@ async fn browser_page(State(app): State<App>, CurrentUser(user): CurrentUser, Qu
         tracing::warn!("could not open the browser for a person: {e:#}");
         return Ok(go("/stores", false, "The server's browser could not be started. The reason is in the server's log."));
     }
-    let flash = PageQuery { msg: q.msg.clone(), err: q.err.clone(), store: None }.flash();
+    let flash = PageQuery { msg: q.msg.clone(), err: q.err.clone(), ..Default::default() }.flash();
     let chrome = chrome_with(&app, &user, flash).await?;
     let name = ui::store_name(&q.store);
     let setup = crate::stores::browser_setup(&app.db, &q.store).await?;
@@ -2014,6 +2217,8 @@ async fn settings_view(app: &App, user: &User, flash: Option<Flash>, new_token: 
     .await?;
     let users = if user.is_admin { db::list_users(&app.db).await? } else { vec![] };
     let backups = if user.is_admin { crate::backup::list(&app.cfg.backup_dir) } else { vec![] };
+    let newer = crate::update::known_newer().filter(|_| user.is_admin);
+    let last_update = crate::update::status().filter(|_| user.is_admin);
     let now = db::now();
     let address = app.cfg.public_url.clone().unwrap_or_else(|| format!("http://<this server's address>:{}", app.cfg.bind.port()));
 
@@ -2100,6 +2305,22 @@ async fn settings_view(app: &App, user: &User, flash: Option<Flash>, new_token: 
                     }
                 }
                 button type="submit" { "Save" }
+            }
+        }
+
+        div.card #keepa {
+            h2 { "Past Amazon prices" }
+            p.muted {
+                "Keepa keeps years of Amazon price history. With your own Keepa key (a paid service of theirs), "
+                "an Amazon product's page here gets a button that fetches its past prices."
+            }
+            form method="post" action="/settings/keepa" {
+                div.field {
+                    label for="keepa_key" { "Keepa key" }
+                    input #keepa_key type="password" name="keepa_key" autocomplete="off"
+                        placeholder=(if s.keepa_key.is_empty() { "None" } else { "Saved. Type a new one to replace it, or none to remove it." });
+                }
+                button.secondary type="submit" { "Save" }
             }
         }
 
@@ -2273,10 +2494,40 @@ async fn settings_view(app: &App, user: &User, flash: Option<Flash>, new_token: 
                             }
                         }
                     }
-                    dt { "Version" } dd { (env!("CARGO_PKG_VERSION")) }
+                    dt #version { "Version" }
+                    dd {
+                        (crate::update::current())
+                        @match &newer {
+                            Some(release) => {
+                                ". Version " strong { (release.version) } " is available ("
+                                a href=(release.page) target="_blank" rel="noopener noreferrer" { "what changed" } ")."
+                            }
+                            None if app.cfg.update_check => { ". No newer version is known." }
+                            None => {}
+                        }
+                        @if let Some(note) = last_update.as_ref().filter(|n| n.state == "failed") {
+                            div.hint { "The last update did not go through: " (note.message) }
+                        }
+                        @if newer.is_some() && !crate::update::can_install(app) {
+                            div.hint { "To update, run this on the server: " code { "sudo amepricetrack-update" } }
+                        }
+                        @if !app.cfg.update_check { div.hint { "Looking for new versions is turned off (APT_UPDATE_CHECK=0)." } }
+                    }
                 }
-                form method="post" action="/settings/backup" data-once {
-                    button.secondary type="submit" data-busy="Copying\u{2026}" { "Back up now" }
+                div.actions {
+                    form method="post" action="/settings/backup" data-once {
+                        button.secondary type="submit" data-busy="Copying\u{2026}" { "Back up now" }
+                    }
+                    @if newer.is_some() && crate::update::can_install(app) {
+                        form method="post" action="/settings/update" data-once
+                            data-confirm="Update the server now? It restarts and is away for about a minute." {
+                            button type="submit" data-busy="Starting\u{2026}" { "Update now" }
+                        }
+                    } @else if app.cfg.update_check {
+                        form method="post" action="/settings/update/check" data-once {
+                            button.secondary type="submit" data-busy="Looking\u{2026}" { "Look for updates" }
+                        }
+                    }
                 }
             }
         }
@@ -2522,6 +2773,34 @@ async fn backup_now(State(app): State<App>, CurrentUser(user): CurrentUser) -> W
             tracing::error!("backup on request failed: {e:#}");
             go("/settings", false, &format!("The backup could not be written: {e:#}"))
         }
+    })
+}
+
+/// Has the machine install the latest release; the installer restarts the server.
+async fn update_now(State(app): State<App>, CurrentUser(user): CurrentUser) -> WebResult {
+    if !user.is_admin {
+        return Ok(go("/settings#version", false, "Only the administrator can update the server."));
+    }
+    match crate::update::request(&app).await {
+        Ok(()) => Ok(go(
+            "/settings#version",
+            true,
+            "The update has started. The server restarts by itself; reload this page in about a minute.",
+        )),
+        Err(problem) => back("/settings#version", problem),
+    }
+}
+
+async fn update_check(State(app): State<App>, CurrentUser(user): CurrentUser) -> WebResult {
+    if !user.is_admin {
+        return Ok(go("/settings#version", false, "Only the administrator can look for updates."));
+    }
+    Ok(match crate::update::latest(&app, true).await {
+        Some(release) if crate::update::is_newer(&release.version, crate::update::current()) => {
+            go("/settings#version", true, &format!("Version {} is available.", release.version))
+        }
+        Some(_) => go("/settings#version", true, "This is the latest version."),
+        None => go("/settings#version", false, "Could not find out. The server could not reach the releases page."),
     })
 }
 

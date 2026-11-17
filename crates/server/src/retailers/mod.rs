@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 use url::Url;
 
-pub use parsers::{blocked_reason, parse};
+pub use parsers::{bestbuy_pickup, blocked_reason, parse, staples_store};
 
 /// How the server reads a store's product page.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -267,6 +267,9 @@ pub struct Observation {
     pub ships_free: Option<bool>,
     /// The delivery charge, when the page states one.
     pub shipping_cents: Option<i64>,
+    /// True when the chain's local store has it to collect today, false when
+    /// it does not. None when the page does not say.
+    pub pickup: Option<bool>,
 }
 
 /// The local store a chain used for a price.

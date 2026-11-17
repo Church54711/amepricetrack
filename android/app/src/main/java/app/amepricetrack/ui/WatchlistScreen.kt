@@ -52,6 +52,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.ui.platform.LocalContext
 import app.amepricetrack.App
 import app.amepricetrack.data.WatchItem
+import app.amepricetrack.data.buyByText
+import app.amepricetrack.data.daysUntil
+import app.amepricetrack.widget.DealsWidget
 import app.amepricetrack.data.dollars
 import app.amepricetrack.data.looksLikeLink
 import coil.compose.AsyncImage
@@ -66,7 +69,11 @@ fun WatchlistScreen(app: App, version: Int, onOpen: (Long) -> Unit, onFind: (Str
 
     suspend fun load() {
         val result = app.attempt { app.api.watches() }
-        result.onSuccess { state = Load.Ready(it) }
+        result.onSuccess {
+            state = Load.Ready(it)
+            // The home-screen widget shows the same list.
+            runCatching { DealsWidget.show(app, it) }
+        }
         // Keep showing the list when a refresh fails.
         result.onFailure { if (state is Load.Ready) onMessage(result.problem()) else state = Load.Failed(result.problem()) }
     }
@@ -226,6 +233,11 @@ fun Badges(item: WatchItem) {
         item.elsewhere?.takeIf { total != null && it.cents < total }?.let { Tag("${dollars(it.cents)} at ${it.storeName}", TagKind.Warn) }
         if (p.thirdParty == true) Tag("Marketplace seller", TagKind.Warn)
         if (item.watch.checkMinutes != null) Tag("Watched closely", TagKind.Plain)
+        item.watch.buyBy?.let { day ->
+            val now = System.currentTimeMillis() / 1000
+            Tag(buyByText(day, now), if (daysUntil(day, now) in 0..3) TagKind.Warn else TagKind.Plain)
+        }
+        if (p.pickup == true) Tag("At your store today", TagKind.Good)
         val target = item.watch.targetPriceCents
         if (target != null && yours != null && yours <= target) Tag("Target reached", TagKind.Good)
         if (p.currentPriceCents == null && p.lastError != null) Tag("Could not read price", TagKind.Bad)

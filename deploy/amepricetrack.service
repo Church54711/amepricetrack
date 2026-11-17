@@ -10,6 +10,8 @@ WorkingDirectory=/var/lib/amepricetrack
 # Chrome keeps its profile and cache under the home directory.
 Environment=HOME=/var/lib/amepricetrack
 Environment=APT_DATA_DIR=/var/lib/amepricetrack
+# Lets the administrator update from the Settings page (see amepricetrack-update.path).
+Environment=APT_UPDATE_REQUEST=/var/lib/amepricetrack/update-requested
 EnvironmentFile=-/etc/amepricetrack.env
 ExecStart=/usr/local/bin/amepricetrack
 Restart=on-failure

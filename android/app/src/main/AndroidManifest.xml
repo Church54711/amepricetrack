@@ -3,6 +3,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The app updates itself from the project's releases page (Settings, Updates). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
 
     <!-- The server is self-hosted, usually on the home network without HTTPS. -->
     <application
@@ -38,5 +41,21 @@
                 <data android:scheme="amepricetrack" android:host="products" />
             </intent-filter>
         </activity>
+
+        <!-- The home-screen widget of the watchlist's best prices. -->
+        <receiver
+            android:name=".widget.DealsWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/deals_widget_info" />
+        </receiver>
+
+        <!-- Hears from Android how installing an update went. -->
+        <receiver android:name=".data.UpdateReceiver" android:exported="false" />
     </application>
 </manifest>

@@ -41,14 +41,24 @@ checking. Data lives in a single SQLite file.
   read for two days you get an alert, and another when it reads again.
 - **Watches closely when you ask.** A product you are waiting on can be
   checked every 30 minutes, hour or two hours instead of the usual four.
+- **Buy-by day.** Give a product the day you need it by. In the last week
+  every drop is announced and the price is checked more often, and you are
+  reminded a few days ahead, the day before and on the day.
+- **Price history in and out.** A chart per product, a CSV download, and a
+  way to add prices from before tracking started (pasted, or from Keepa for
+  Amazon).
 - **Backs itself up.** A copy of the database is written once a day and the
   newest 14 are kept.
+- **Updates with one button.** The administrator is told when a new version
+  is out and can install it from the Settings page; the app updates itself
+  the same way.
 - **AI assistant** that sees your watchlist, and helps with matching: it
   picks the right search results and judges listings that no barcode
   settles. Works with Claude, OpenAI, DeepSeek, Gemini, OpenRouter, Ollama,
   LM Studio, or any OpenAI-compatible address.
-- **Local prices.** With your ZIP code, Target prices come from the store
-  nearest you.
+- **Your local stores.** With your ZIP code, Target prices come from the
+  store nearest you, and Staples and Best Buy say whether your store has the
+  item to collect today.
 - **Themes.** OLED Black & Gold by default, plus Midnight Blue, Light and
   "match my device", each with an optional custom accent colour.
 - **Several people** can share one server; watchlists, discounts and
@@ -210,7 +220,18 @@ internet connection the request comes from, and (as tested in November 2026)
 ignores a store named by a plain request. The Stores page shows which store
 Walmart used for the server's readings. On a server at home that is normally
 a store near you. If it is not your store, choose your store in the server's
-own browser (below). The other built-in stores show one online price everywhere.
+own browser (below).
+
+Staples and Best Buy charge one online price everywhere (the same product
+read under four ZIP codes in November 2026 cost the same at each), but what
+can be collected today depends on the store. Saving a ZIP code gives it to
+both through the server's browser, each then uses its store nearest to it,
+and a product's page says "Ready to collect today" or "Not on the shelf".
+The Stores page shows which store each chose, after the next price check
+there. Without a ZIP code they pick a store from the server's internet
+connection. A store chosen by hand in the server's browser afterwards stays
+until the ZIP code is saved again. Amazon, Kohl's, Harbor Freight and Hot
+Topic show one online price everywhere.
 
 **The server's browser.** The server reads several stores with a real Chrome
 of its own, and that browser keeps its cookies. The administrator can use it
@@ -246,7 +267,19 @@ signed-out pages, not yet with a real account.
 
 ## Install on Ubuntu
 
-Needs Ubuntu 22.04 or newer and [Rust](https://rustup.rs).
+Needs Ubuntu 22.04 or newer, on a 64-bit Intel/AMD or ARM machine.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Church54711/amepricetrack/master/deploy/install.sh | sudo bash
+```
+
+This downloads the latest release, checks it against its checksum, installs
+Xvfb and Google Chrome, creates an `amepricetrack` system user, installs the
+program as a service that starts on boot, and prints the address to open.
+The first visitor creates the administrator account. No build tools are
+needed.
+
+To build it yourself instead, with [Rust](https://rustup.rs) installed:
 
 ```sh
 sudo apt install build-essential
@@ -254,22 +287,64 @@ cargo build --release
 sudo deploy/install.sh
 ```
 
-The script installs Xvfb and Google Chrome, creates an `amepricetrack`
-system user, installs the program as a service that starts on boot, and
-prints the address to open. The first visitor creates the administrator
-account. To update later: `git pull`, build again, run the script again.
+### Updating
+
+The server looks for a newer release a few times a day and tells the
+administrator (`APT_UPDATE_CHECK=0` turns that off). Then either:
+
+- press **Update now** on the Settings page, under Server, or in the phone
+  app's Settings; or
+- run `sudo amepricetrack-update` on the server.
+
+Both download the latest release, check it, replace the program and restart
+the service; data and settings are kept. The server is away for about a
+minute. The button works by creating an empty file that a small root service
+watches for (`amepricetrack-update.path`); the website itself never runs
+anything as root and cannot choose what gets installed.
+
+### A secure address (HTTPS)
+
+Out of the box the site speaks plain HTTP on port 8787, which is fine inside
+a home network and nowhere else: passwords would cross the network readable.
+The installer sets up HTTPS when asked:
+
+```sh
+sudo amepricetrack-update --https
+```
+
+It offers two ways.
+
+**Tailscale** (recommended). A private network between your own devices;
+nothing is opened on the router and the address works from anywhere. The
+installer installs Tailscale if needed, has you sign the machine in (a free
+account is enough), and has Tailscale serve the site at
+`https://<machine>.<your-tailnet>.ts.net` with a real certificate. The first
+time, Tailscale may print a link to switch HTTPS on for your account. Install
+the Tailscale app on each phone or computer that should reach the server and
+sign in with the same account.
+
+**Caddy**, for a public address with a domain name you own
+(`--https=caddy --domain=prices.example.com`). The domain has to point at
+the machine and ports 80 and 443 have to reach it; Caddy then gets and renews
+the certificate by itself.
+
+Either way the installer writes `APT_PUBLIC_URL`, sets
+`APT_SECURE_COOKIES=1` and makes the program listen on this machine only
+(`APT_BIND=127.0.0.1:8787`), so the old plain address stops working. Sign in
+again at the new address, and put it in the phone app.
+
+The Tailscale and Caddy steps have been run against stand-ins for those
+programs, not yet against a real Tailscale account or a real domain.
 
 - Settings: `/etc/amepricetrack.env` (see `deploy/amepricetrack.env.example`)
 - Data: `/var/lib/amepricetrack`
 - Backups: `/var/lib/amepricetrack/backups` (see "Backups" below)
 - Log: `journalctl -u amepricetrack -f`
 
-The site speaks plain HTTP on port 8787. To reach it from outside your home
-network, put it behind a reverse proxy with HTTPS (Caddy, nginx) or a private
-network such as Tailscale, and set `APT_SECURE_COOKIES=1` when using HTTPS.
-Behind a proxy, also set `APT_PUBLIC_URL` to the address you open the site
-with: forms are only accepted from the site's own address, and a proxy that
-does not pass that address on would otherwise have every form refused.
+Behind a proxy of your own, set `APT_SECURE_COOKIES=1` and set
+`APT_PUBLIC_URL` to the address you open the site with: forms are only
+accepted from the site's own address, and a proxy that does not pass that
+address on would otherwise have every form refused.
 
 **Who can reach what.** The server fetches addresses people give it. Store
 addresses must be public websites; a name that leads to a machine on your
@@ -302,6 +377,32 @@ To go back to a backup: stop the server, replace `amepricetrack.db` with the
 copy (and delete `amepricetrack.db-wal` and `amepricetrack.db-shm` if they
 are there), and start the server again.
 
+## Price history
+
+Each product's page has a chart of the listed price (and of your signed-in
+price, when there is one). Once the history is long enough, the chart can be
+narrowed to the last month, three months or year.
+
+**Download.** "Download as a spreadsheet (CSV)" under Recorded changes gives
+every recorded change: time, price, regular price, stock, whether it was the
+listed or your signed-in price, and where the reading came from.
+
+**Prices from before.** Tracking starts with an empty history, so the
+average and "lowest recorded" mean little at first. Under "Prices from
+before" you can paste one date and price per line (`2025-03-01, 19.99`;
+columns copied from a spreadsheet work, and so does a downloaded file). Only
+prices dated before the server's own first reading are kept, and adding
+again replaces what was added before. The history is shared by everyone who
+tracks the product, so where someone else tracks it too, only the
+administrator can add to it.
+
+**Amazon, from Keepa.** [Keepa](https://keepa.com) keeps years of Amazon
+prices. With your own Keepa key on the Settings page (a paid service of
+theirs), an Amazon product's page gets a button that fetches its history:
+the price Amazon itself charged, or the lowest new offer where Amazon never
+sold it. The key is sent only to Keepa. This reads Keepa's documented
+format and is tested against sample answers, not yet with a real key.
+
 ## Run it for development
 
 ```sh
@@ -329,6 +430,7 @@ All optional, set as environment variables.
 | `APT_SECURE_COOKIES` | off | Set to `1` when served over HTTPS. |
 | `APT_BACKUP_KEEP` | `14` | How many daily copies of the database to keep; `0` turns backups off. |
 | `APT_BACKUP_DIR` | `backups` in the data folder | Where those copies are written. |
+| `APT_UPDATE_CHECK` | on | Set to `0` to stop the server looking for newer releases. |
 | `APT_MEMBERS_LOCAL_NETWORK` | off | Set to `1` to let people who are not the administrator point their AI service, ntfy topic or webhook at an address on the home network. |
 | `APT_LOG` | `info,sqlx=warn` | Log detail. |
 | `APT_DEBUG_PAGES` | off | Folder where the last unreadable page per store is saved. |
@@ -376,6 +478,14 @@ each phone can instead be given a theme of its own in the app's Settings.
   any ntfy server of your own, keeps a connection open instead.
 - **Watching closely**: a product's alert settings include how often the
   server checks it.
+- **Buy-by day**: chosen from a calendar in a product's alert settings.
+- **Widget**: "Best prices" for the home screen lists what has reached its
+  target, what is at its lowest and the biggest drops. It refreshes about
+  once an hour while the phone can reach the server, and when tapped.
+- **Updates**: Settings shows the app's version and the server's. "Update"
+  downloads the new app from the project's releases page and hands it to
+  Android, which checks it is the same app signed with the same key. The
+  administrator can update the server from there too.
 - **Prices from this phone**: the app opens product pages in its own
   browser and sends them to the server. Open a store there once to sign in
   or pick your local store, and its prices are kept as your own. This is how
@@ -395,6 +505,12 @@ each phone can instead be given a theme of its own in the app's Settings.
   hourly or off are the other choices), one small request each time. For
   instant alerts with no checking at all, use "Instant alerts" above.
 - **Assistant**: ask the connected AI about your tracked prices.
+
+Install it by downloading `AmePriceTrack.apk` from the
+[latest release](https://github.com/Church54711/amepricetrack/releases/latest)
+on the phone and opening it. Later versions install from inside the app.
+[Obtainium](https://obtainium.imranr.dev) can follow the releases page
+instead, if you use it.
 
 Build it with Android Studio, or from a terminal with a JDK (17 or newer)
 and the Android SDK installed:
@@ -420,7 +536,9 @@ except `login`.
 | `GET me` | Account, theme, unread alerts, the stores (built-in and added), the server's location, and `check_interval_minutes`. |
 | `GET watches` / `POST watches` `{url, target_price_cents?}` | List and add products. `url` may be the text a store app shares. |
 | `GET products/{id}` | One product with price history. |
-| `POST products/{id}/watch`, `DELETE products/{id}/watch` | Change alert settings (`check_minutes`, 15 to 1440, has the product checked that often; leave it out for the usual pace), stop tracking. |
+| `POST products/{id}/watch`, `DELETE products/{id}/watch` | Change alert settings (`check_minutes`, 15 to 1440, has the product checked that often; leave it out for the usual pace. `buy_by` is a day such as `2026-11-28`, `""` for none; left out, it stays as it is), stop tracking. |
+| `GET products/{id}/history.csv` | The price history as a CSV file. |
+| `POST products/{id}/history` `{prices}` | Add prices from before tracking started: lines of "date, price" as text. |
 | `POST products/{id}/check` | Check now. |
 | `POST products/{id}/compare` | Search the other stores for this product (again). Results arrive in `other_stores` of `GET products/{id}`; `judged_by` is `ai` for matches the AI made. |
 | `POST comparisons/{id}` `{same}` | Confirm or reject a possible match. |
@@ -433,6 +551,7 @@ except `login`.
 | `POST chat` `{message}` | Ask the assistant. |
 | `GET push`, `POST push` `{ntfy_url}` | Where alerts are pushed; set or (with an empty address) clear the ntfy topic. |
 | `POST push/test` | Push a test alert now. |
+| `GET update`, `POST update` | The server's version, the newer release if the administrator asks, and (administrator only) install it. |
 
 ## Layout
 
@@ -449,6 +568,8 @@ crates/server/src
   health.rs      noticing when a whole store stops being readable
   net.rs         keeping requests people ask for off the home network
   backup.rs      daily copies of the database
+  history.rs     price history out (CSV) and in (pasted, Keepa)
+  update.rs      knowing about newer releases, asking for one to be installed
   browser.rs     driving Chrome
   scheduler.rs   the background checking loop
   pricing.rs     discounts, delivery, personal price, averages
@@ -457,6 +578,23 @@ crates/server/src
   service.rs     actions shared by the site and the API
   web.rs, ui.rs  the website            (static/ holds the CSS and script)
   api.rs         the phone API
-deploy/          Ubuntu service file and install script
+deploy/          Ubuntu service files and the install/update script
 android/         the Android app (Kotlin, Jetpack Compose)
+.github/         builds and tests on every push; a release for every v* tag
 ```
+
+## Making a release
+
+Set the version in `crates/server/Cargo.toml` (the app takes its version
+from there), commit, then tag and push:
+
+```sh
+git tag v0.3.0 && git push origin master v0.3.0
+```
+
+The tag has to match the version. GitHub builds the server for Intel/AMD and
+ARM, builds the app signed with the release key, and publishes them with
+their checksums. The key lives outside the repository, in the repository's
+secrets `APT_KEYSTORE_BASE64`, `APT_KEYSTORE_PASSWORD` and `APT_KEY_ALIAS`.
+Keep a copy of the key file and its password: without them no later version
+can update an installed app.

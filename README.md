@@ -5,18 +5,23 @@ keeps the history, and tells you when it drops.
 
 - Staples, Best Buy, Walmart, Target, Amazon, Kohl's, Harbor Freight,
   Hot Topic, and most other shops
-- Alerts for a target price, a drop, or back in stock
+- Alerts for a target price, a drop, back in stock, or a buy-by day
 - Finds the same product at other stores and compares
 - Your own discounts and member prices
 - Android app in `android/`
 
-## Run
+## Install
+
+On Ubuntu:
 
 ```sh
-cargo run    # http://localhost:8787
+curl -fsSL https://raw.githubusercontent.com/Church54711/amepricetrack/master/deploy/install.sh | sudo bash
 ```
 
-On Ubuntu: `cargo build --release && sudo deploy/install.sh`
+The Android app is `AmePriceTrack.apk` in the
+[latest release](https://github.com/Church54711/amepricetrack/releases/latest).
+
+From source: `cargo run`, then open http://localhost:8787.
 
 Everything else is in [docs/guide.md](docs/guide.md).
 

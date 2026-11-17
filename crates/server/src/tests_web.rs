@@ -662,3 +662,146 @@ async fn someone_who_is_not_the_administrator_cannot_point_the_server_at_the_hom
     let (_, headers, _) = send(&site, post_form("/settings/alerts", &admin, form)).await;
     assert!(location(&headers).starts_with("/settings?msg="), "{}", location(&headers));
 }
+
+#[tokio::test]
+async fn a_buy_by_day_makes_checks_closer_and_sends_reminders_once() {
+    use crate::{alerts, db, service};
+    const FOUR_HOURS: i64 = 4 * 3600;
+
+    let (site, app) = site_and_app().await;
+    let cookie = set_up(&site).await;
+    send(&site, post_form("/watches", &cookie, ADD_CHAIR)).await;
+    let day = |ahead: i64| service::day_text(db::now() + ahead * db::DAY);
+
+    // A day that has passed is refused; one five days off is kept and shown.
+    let (_, headers, _) = send(&site, post_form("/products/1/watch", &cookie, &format!("any_drop=on&buy_by={}", day(-3)))).await;
+    assert!(location(&headers).contains("err="), "{}", location(&headers));
+    let (_, headers, _) = send(&site, post_form("/products/1/watch", &cookie, &format!("any_drop=on&buy_by={}", day(5)))).await;
+    assert!(location(&headers).contains("msg="), "{}", location(&headers));
+    let (_, _, body) = send(&site, get("/products/1", &cookie)).await;
+    assert!(body.contains(&format!(r#"name="buy_by" value="{}""#, day(5))), "the day is shown as saved");
+    let (_, _, body) = send(&site, get("/", &cookie)).await;
+    assert!(body.contains("Buy by "), "the watchlist says so");
+    assert_eq!(db::check_interval(&app.db, 1, FOUR_HOURS).await.unwrap(), 3600, "hourly in the last week");
+
+    // The phone app: leaving the day out keeps it, a new one replaces it, an empty one removes it.
+    let login = json!({ "username": "sam", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (_, _, body) = send(&site, post_json("/api/v1/products/1/watch", &token, json!({ "note": "gift" }))).await;
+    let kept = serde_json::from_str::<Value>(&body).unwrap()["watch"]["buy_by"].as_i64().unwrap();
+    assert_eq!(service::day_text(kept), day(5));
+    let (status, _, body) = send(&site, post_json("/api/v1/products/1/watch", &token, json!({ "buy_by": day(1) }))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(db::check_interval(&app.db, 1, FOUR_HOURS).await.unwrap(), 1800, "every half hour in the last two days");
+    let (status, _, _) = send(&site, post_json("/api/v1/products/1/watch", &token, json!({ "buy_by": "next friday" }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Saved with the day already tomorrow, no reminder is owed for "tomorrow".
+    alerts::buy_by_reminders(&app).await.unwrap();
+    assert_eq!(db::unread_count(&app.db, 1).await.unwrap(), 0);
+    // A day set a while ago, now tomorrow: one reminder, and only one.
+    sqlx::query("UPDATE watches SET buy_by_told = 1").execute(&app.db).await.unwrap();
+    alerts::buy_by_reminders(&app).await.unwrap();
+    alerts::buy_by_reminders(&app).await.unwrap();
+    let alerts = db::notifications(&app.db, 1, 0, 10).await.unwrap();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].kind, "buy_by");
+    assert!(alerts[0].title.ends_with("that is tomorrow"), "{}", alerts[0].title);
+
+    let (_, _, body) = send(&site, post_json("/api/v1/products/1/watch", &token, json!({ "buy_by": "" }))).await;
+    assert!(serde_json::from_str::<Value>(&body).unwrap()["watch"]["buy_by"].is_null());
+    assert_eq!(db::check_interval(&app.db, 1, FOUR_HOURS).await.unwrap(), FOUR_HOURS);
+}
+
+#[tokio::test]
+async fn price_history_can_be_downloaded_and_older_prices_added() {
+    use crate::db;
+    use crate::retailers::Observation;
+
+    let (site, app) = site_and_app().await;
+    let cookie = set_up(&site).await;
+    send(&site, post_form("/watches", &cookie, ADD_CHAIR)).await;
+    let seen = Observation { price_cents: Some(5000), in_stock: Some(true), ..Default::default() };
+    db::record_observation(&app.db, 1, &seen, "server", db::Audience::Public, None, None).await.unwrap();
+
+    let (status, headers, body) = send(&site, get("/products/1/history.csv", &cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/csv"));
+    assert!(headers[header::CONTENT_DISPOSITION].to_str().unwrap().contains(".csv"));
+    assert!(body.starts_with("time,price,list_price,in_stock,kind,source\n"), "{body}");
+    assert!(body.contains(",50.00,,yes,listed,server"), "{body}");
+
+    // Two older prices; one "from the future" and one from after tracking began are left out.
+    let pasted = "prices=2020-01-05%2C+61.00%0A2020-02-01%2C+39.99%0A2090-01-01%2C+1.00";
+    let (_, headers, _) = send(&site, post_form("/products/1/history", &cookie, pasted)).await;
+    assert!(location(&headers).contains("msg=Added+2+past+prices"), "{}", location(&headers));
+    let product = db::product(&app.db, 1).await.unwrap().unwrap();
+    assert_eq!(product.lowest_price_cents, Some(3999), "the lowest price on record is now an older one");
+    assert_eq!(product.current_price_cents, Some(5000), "today's price is untouched");
+    let (_, _, body) = send(&site, get("/products/1", &cookie)).await;
+    assert!(body.contains("?range=365"), "a long history can be narrowed");
+    assert!(body.contains("Added later"));
+    let (_, _, narrowed) = send(&site, get("/products/1?range=30", &cookie)).await;
+    assert!(narrowed.contains("<svg"), "the last month still draws");
+
+    // Adding again replaces what was added before.
+    let (_, headers, _) = send(&site, post_form("/products/1/history", &cookie, "prices=2021-06-01%2C+45.00")).await;
+    assert!(location(&headers).contains("msg=Added+1+past+price."), "{}", location(&headers));
+    let imported: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM price_points WHERE source = 'import'").fetch_one(&app.db).await.unwrap();
+    assert_eq!(imported, 1);
+    assert_eq!(db::product(&app.db, 1).await.unwrap().unwrap().lowest_price_cents, Some(4500));
+    let (_, headers, _) = send(&site, post_form("/products/1/history", &cookie, "prices=nonsense")).await;
+    assert!(location(&headers).contains("err="));
+
+    // Someone else who tracks the same product cannot rewrite the history everyone sees.
+    send(&site, post_form("/settings/users", &cookie, "username=pat&password=longenough")).await;
+    let (_, headers, _) = send(&site, post_form("/login", "", "username=pat&password=longenough")).await;
+    let pat = cookie_from(&headers);
+    send(&site, post_form("/watches", &pat, ADD_CHAIR)).await;
+    let (_, headers, _) = send(&site, post_form("/products/1/history", &pat, "prices=2019-01-01%2C+0.01")).await;
+    assert!(location(&headers).contains("err=") && location(&headers).contains("administrator"), "{}", location(&headers));
+    assert_eq!(db::product(&app.db, 1).await.unwrap().unwrap().lowest_price_cents, Some(4500));
+
+    // The phone API serves the same file.
+    let login = json!({ "username": "sam", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (status, _, body) = send(&site, get_api("/api/v1/products/1/history.csv", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.lines().count(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn the_server_says_its_version_and_only_updates_where_it_can() {
+    let site = site().await;
+    let cookie = set_up(&site).await;
+    let (_, _, body) = send(&site, get("/settings", &cookie)).await;
+    assert!(body.contains(env!("CARGO_PKG_VERSION")));
+    assert!(body.contains("Looking for new versions is turned off"), "this test server does not look");
+
+    // This server was not installed as a service, so it cannot replace itself.
+    let (_, headers, _) = send(&site, post_form("/settings/update", &cookie, "")).await;
+    assert!(location(&headers).contains("err=") && location(&headers).contains("amepricetrack-update"), "{}", location(&headers));
+
+    let login = json!({ "username": "sam", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (status, _, body) = send(&site, get_api("/api/v1/update", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let state: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(state["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(state["can_install"], false);
+    assert!(state["newer"].is_null());
+    let (status, _, _) = send(&site, post_json("/api/v1/update", &token, json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Someone who is not the administrator is not told about versions and cannot ask for one.
+    send(&site, post_form("/settings/users", &cookie, "username=pat&password=longenough")).await;
+    let login = json!({ "username": "pat", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let pat = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (status, _, _) = send(&site, post_json("/api/v1/update", &pat, json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

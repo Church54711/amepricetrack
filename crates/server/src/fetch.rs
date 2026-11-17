@@ -1,7 +1,7 @@
 //! Gets a product's current price from its store, choosing between a plain
 //! web request and the real browser, and keeping requests to each store slow.
 
-use crate::browser::Browser;
+use crate::browser::{Browser, SiteCookie};
 use crate::config::Config;
 use crate::retailers::{self, FetchMode, Observation, ParseError};
 use regex::Regex;
@@ -216,7 +216,7 @@ impl Fetcher {
             self.take_turn(retailer).await;
             let result = match mode {
                 FetchMode::Http => self.fetch_http(retailer, sku, url).await,
-                FetchMode::Browser => self.fetch_browser(retailer, url).await,
+                FetchMode::Browser => self.fetch_browser(retailer, sku, url).await,
             };
             match result {
                 Ok((obs, html)) => return Ok(Fetched { obs, mode, html }),
@@ -235,7 +235,33 @@ impl Fetcher {
         Err(first_error.unwrap_or(FetchError::NeedsBrowser))
     }
 
-    async fn fetch_browser(&self, retailer: &str, url: &str) -> Result<(Observation, Option<String>), FetchError> {
+    /// Tells the chains that choose a local store from a ZIP code which one to
+    /// use (or, with None, to go back to choosing by themselves). The store a
+    /// chain picked before is forgotten, or it would keep it.
+    pub async fn tell_stores_zip(&self, zip: Option<&str>) -> Result<(), FetchError> {
+        let Some(browser) = self.browser.as_ref() else {
+            return Ok(());
+        };
+        let mut forget = vec![("YourStore", "https://www.staples.com/"), ("locStoreId", "https://www.bestbuy.com/")];
+        let set = match zip {
+            Some(zip) => vec![
+                SiteCookie { name: "zipcode", value: zip.to_string(), domain: ".staples.com" },
+                SiteCookie { name: "customerZipCode", value: format!("{zip}|Y"), domain: ".bestbuy.com" },
+                SiteCookie { name: "locDestZip", value: zip.to_string(), domain: ".bestbuy.com" },
+            ],
+            None => {
+                forget.extend([
+                    ("zipcode", "https://www.staples.com/"),
+                    ("customerZipCode", "https://www.bestbuy.com/"),
+                    ("locDestZip", "https://www.bestbuy.com/"),
+                ]);
+                vec![]
+            }
+        };
+        browser.place_cookies(&set, &forget).await.map_err(|e| FetchError::Other(format!("{e:#}")))
+    }
+
+    async fn fetch_browser(&self, retailer: &str, sku: &str, url: &str) -> Result<(Observation, Option<String>), FetchError> {
         let browser = self.browser.as_ref().ok_or(FetchError::NeedsBrowser)?;
         Self::public_only(url).await?;
         // Some stores refuse the very first visit from a browser they have not
@@ -246,9 +272,28 @@ impl Fetcher {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            let html = browser.fetch_html(url).await.map_err(|e| FetchError::Other(format!("{e:#}")))?;
+            // The cookie in which the chain keeps the store it chose for the visitor.
+            let store_cookie: &[&str] = match retailer {
+                "staples" => &["YourStore"],
+                "bestbuy" => &["locStoreId"],
+                _ => &[],
+            };
+            let (html, cookies) = browser.fetch_page(url, store_cookie).await.map_err(|e| FetchError::Other(format!("{e:#}")))?;
             match retailers::parse(retailer, &html) {
-                Ok(obs) => return Ok((obs, Some(html))),
+                Ok(mut obs) => {
+                    let chosen = cookies.first().map(|(_, value)| value.as_str());
+                    match retailer {
+                        "staples" => obs.local_store = chosen.and_then(retailers::staples_store),
+                        "bestbuy" => {
+                            obs.pickup = retailers::bestbuy_pickup(&html, sku);
+                            obs.local_store = chosen
+                                .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+                                .map(|id| retailers::LocalStore { id: id.to_string(), place: String::new() });
+                        }
+                        _ => {}
+                    }
+                    return Ok((obs, Some(html)));
+                }
                 Err(e) => {
                     self.keep_failed_page(retailer, &html);
                     last_error = e.into();
@@ -410,6 +455,8 @@ mod tests {
             backup_keep: 0,
             backup_dir: std::env::temp_dir(),
             members_local_network: false,
+            update_check: false,
+            update_request: None,
         };
         Fetcher::new(&cfg).unwrap()
     }

@@ -62,9 +62,17 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.amepricetrack.App
 import app.amepricetrack.data.Alert
+import app.amepricetrack.data.AppRelease
+import app.amepricetrack.data.ServerUpdate
+import app.amepricetrack.data.UpdateStep
+import app.amepricetrack.data.Updater
 import app.amepricetrack.data.newNtfyAddress
 import app.amepricetrack.data.ntfyAppLink
 import app.amepricetrack.work.AlertWorker
+import androidx.glance.appwidget.GlanceAppWidgetManager
+import app.amepricetrack.widget.DealsWidget
+import app.amepricetrack.widget.DealsWidgetReceiver
+import app.amepricetrack.widget.WidgetStore
 import app.amepricetrack.work.ReportWorker
 import kotlinx.coroutines.launch
 
@@ -320,6 +328,80 @@ private fun InstantAlertsCard(app: App, checksInBackground: Boolean, onStopCheck
     }
 }
 
+/** This app's version and the server's, each with one button to update it. */
+@Composable
+private fun UpdatesCard(app: App) {
+    val scope = rememberCoroutineScope()
+    val updater = remember { Updater(app) }
+    val step by Updater.step.collectAsStateWithLifecycle()
+    var looking by remember { mutableStateOf(false) }
+    // Null until looked for; a release when a newer one exists.
+    var looked by remember { mutableStateOf(false) }
+    var release by remember { mutableStateOf<AppRelease?>(null) }
+    var server by remember { mutableStateOf<ServerUpdate?>(null) }
+    var note by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
+    var serverStarted by remember { mutableStateOf(false) }
+
+    suspend fun look() {
+        looking = true
+        note = null
+        try {
+            release = updater.newer()
+            looked = true
+        } catch (e: Exception) {
+            note = (e.message ?: "Could not look for updates.") to false
+        }
+        app.attempt { app.api.serverUpdate() }.onSuccess { server = it }
+        looking = false
+    }
+
+    LaunchedEffect(Unit) { look() }
+
+    Card {
+        SectionTitle("Updates")
+        note?.let { (text, good) -> Banner(text, good = good) }
+
+        Text("This app: version ${updater.installedVersion}", fontWeight = FontWeight.Medium)
+        val found = release
+        when (val now = step) {
+            is UpdateStep.Downloading -> Muted("Downloading\u2026 ${now.percent}%")
+            UpdateStep.Installing -> Muted("Installing. Android may ask you to confirm; the app then restarts.")
+            is UpdateStep.Failed -> Banner(now.message, good = false)
+            UpdateStep.Idle -> when {
+                found != null -> Muted("Version ${found.version} is available.")
+                looked -> Muted("This is the latest version.")
+                else -> {}
+            }
+        }
+        if (found != null && step !is UpdateStep.Downloading && step != UpdateStep.Installing) {
+            Button(onClick = { scope.launch { updater.install(found) } }) { Text("Update to ${found.version}") }
+        }
+
+        server?.let { s ->
+            Text("Your server: version ${s.version}", fontWeight = FontWeight.Medium)
+            when {
+                serverStarted -> Muted("The server is updating and restarts by itself. It is away for about a minute.")
+                s.newer != null && s.canInstall -> {
+                    Muted("Version ${s.newer} is available.")
+                    Button(onClick = {
+                        scope.launch {
+                            val asked = app.attempt { app.api.updateServer() }
+                            if (asked.isSuccess) serverStarted = true else note = asked.problem() to false
+                        }
+                    }) { Text("Update the server to ${s.newer}") }
+                }
+                s.newer != null -> Muted("Version ${s.newer} is available. On the server, run: sudo amepricetrack-update")
+                else -> {}
+            }
+            s.lastProblem?.let { Muted("The server's last update did not go through: $it") }
+        }
+
+        OutlinedButton(enabled = !looking, onClick = { scope.launch { look() } }) {
+            Text(if (looking) "Looking\u2026" else "Look for updates")
+        }
+    }
+}
+
 private fun themeName(id: String) = when (id) {
     "midnight" -> "Midnight Blue"
     "light" -> "Light"
@@ -363,6 +445,9 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
                     AlertWorker.cancel(app)
                     ReportWorker.cancel(app)
                     app.session.signOut()
+                    // The home-screen widget must not keep showing this person's list.
+                    WidgetStore.clear(app)
+                    runCatching { DealsWidget.redraw(app) }
                 }
             }) { Text("Sign out") }
         }
@@ -465,5 +550,23 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
                 }) { Text("Update from the website") }
             }
         }
+
+        Card {
+            SectionTitle("Home screen widget")
+            Muted(
+                "\u201cBest prices\u201d shows what has reached its target, what is at its lowest and the biggest drops, " +
+                    "without opening the app. It refreshes about once an hour while the phone can reach your server.",
+            )
+            OutlinedButton(onClick = {
+                scope.launch {
+                    val asked = runCatching { GlanceAppWidgetManager(app).requestPinGlanceAppWidget(DealsWidgetReceiver::class.java) }
+                    if (asked.getOrNull() != true) {
+                        message = "This home screen does not take widgets from apps. Add it by hand: press and hold the home screen, then choose Widgets."
+                    }
+                }
+            }) { Text("Add to the home screen") }
+        }
+
+        UpdatesCard(app)
     }
 }

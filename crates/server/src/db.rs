@@ -91,6 +91,9 @@ pub struct Product {
     /// How the server's own last attempt to read it went; None before the
     /// first attempt. Readings from phones do not change this.
     pub server_read_ok: Option<bool>,
+    /// True when the chain's local store had it to collect at the server's
+    /// last reading, false when it did not, None when the store does not say.
+    pub pickup: Option<bool>,
 }
 
 impl Product {
@@ -120,6 +123,37 @@ pub struct Watch {
     /// How often this person wants the product checked, in minutes; None
     /// for the server's usual pace.
     pub check_minutes: Option<i64>,
+    /// The day the person wants to have bought it by, as noon UTC of that day.
+    pub buy_by: Option<i64>,
+    /// The last reminder sent about that day; see `buy_by_stage`.
+    #[serde(skip)]
+    pub buy_by_told: i64,
+}
+
+/// Whole days from now until the buy-by day: 0 on the day, negative after it.
+pub fn days_until(buy_by: i64, now: i64) -> i64 {
+    (buy_by + DAY / 2 - now).div_euclid(DAY)
+}
+
+/// How close the buy-by day is, as the reminder that goes with it: 0 not
+/// close, 1 within three days, 2 the day before, 3 on the day, 4 past.
+pub fn buy_by_stage(buy_by: i64, now: i64) -> i64 {
+    match days_until(buy_by, now) {
+        d if d < 0 => 4,
+        0 => 3,
+        1 => 2,
+        2 | 3 => 1,
+        _ => 0,
+    }
+}
+
+/// The pace of checks a nearing buy-by day asks for, in minutes.
+fn buy_by_pace(buy_by: Option<i64>, now: i64) -> Option<i64> {
+    match days_until(buy_by?, now) {
+        0..=2 => Some(30),
+        3..=7 => Some(60),
+        _ => None,
+    }
 }
 
 /// The shortest and longest time between checks a person can ask for, in minutes.
@@ -190,6 +224,8 @@ pub struct Settings {
     pub ai_match_model: String,
     /// Leave marketplace sellers' offers out when comparing stores.
     pub ignore_marketplace: bool,
+    /// The person's Keepa key, for an Amazon product's past prices; empty for none.
+    pub keepa_key: String,
 }
 
 /// A store someone added to this server.
@@ -344,20 +380,20 @@ pub async fn check_soon(db: &Db, product_id: i64) -> Result<()> {
 /// same product at other stores (a confirmed match) is checked as often,
 /// because a short sale there is what the person is waiting for.
 pub async fn check_interval(db: &Db, product_id: i64, usual: i64) -> Result<i64> {
-    let closest: Option<i64> = sqlx::query_scalar(
-        "SELECT MIN(w.check_minutes) FROM watches w
-         WHERE w.check_minutes IS NOT NULL
-           AND (w.product_id = ?1
-                OR w.product_id IN (SELECT c.source_product_id FROM comparisons c
-                                    WHERE c.product_id = ?1 AND c.user_id = w.user_id AND c.status = 'found'))",
+    let now = now();
+    // The pace someone chose, and the nearest buy-by day that has not passed.
+    let (closest, buy_by): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT MIN(w.check_minutes), MIN(CASE WHEN w.buy_by >= ?2 THEN w.buy_by END) FROM watches w
+         WHERE w.product_id = ?1
+            OR w.product_id IN (SELECT c.source_product_id FROM comparisons c
+                                WHERE c.product_id = ?1 AND c.user_id = w.user_id AND c.status = 'found')",
     )
     .bind(product_id)
+    .bind(now - DAY / 2)
     .fetch_one(db)
     .await?;
-    Ok(match close_check(closest) {
-        Some(minutes) => usual.min(minutes * 60),
-        None => usual,
-    })
+    let paces = [close_check(closest), buy_by_pace(buy_by, now)];
+    Ok(paces.into_iter().flatten().fold(usual, |pace, minutes| pace.min(minutes * 60)))
 }
 
 /// After someone asks for closer checks: the product, and its confirmed
@@ -532,12 +568,16 @@ pub async fn record_observation(
     sqlx::query(
         "UPDATE products SET last_checked_at = ?, last_success_at = ?, fail_count = 0, last_error = NULL,
             server_read_ok = CASE WHEN ? THEN 1 ELSE server_read_ok END,
+            -- The local store is the one the server's browser was given; a phone has its own.
+            pickup = CASE WHEN ? THEN ? ELSE pickup END,
             fetch_mode = COALESCE(?, fetch_mode), next_check_at = COALESCE(?, next_check_at)
          WHERE id = ?",
     )
     .bind(ts)
     .bind(ts)
     .bind(source == "server")
+    .bind(source == "server")
+    .bind(obs.pickup)
     .bind(mode.map(FetchMode::as_str))
     .bind(next_check_in.map(|s| ts + s))
     .bind(product_id)
@@ -641,6 +681,7 @@ pub struct WatchEdit {
     pub notify_back_in_stock: bool,
     pub note: Option<String>,
     pub check_minutes: Option<i64>,
+    pub buy_by: Option<i64>,
 }
 
 pub async fn update_watch(db: &Db, user_id: i64, product_id: i64, e: &WatchEdit) -> Result<bool> {
@@ -650,7 +691,10 @@ pub async fn update_watch(db: &Db, user_id: i64, product_id: i64, e: &WatchEdit)
         "UPDATE watches SET
             last_alert_price_cents = CASE WHEN target_price_cents IS ?1 THEN last_alert_price_cents ELSE NULL END,
             target_price_cents = ?1, drop_percent = ?2, notify_any_drop = ?3,
-            notify_back_in_stock = ?4, note = ?5, check_minutes = ?6
+            notify_back_in_stock = ?4, note = ?5, check_minutes = ?6,
+            -- A new day starts from the reminder that fits it now, so only later ones are sent.
+            buy_by_told = CASE WHEN buy_by IS ?9 THEN buy_by_told ELSE ?10 END,
+            buy_by = ?9
          WHERE user_id = ?7 AND product_id = ?8",
     )
     .bind(e.target_price_cents)
@@ -661,9 +705,12 @@ pub async fn update_watch(db: &Db, user_id: i64, product_id: i64, e: &WatchEdit)
     .bind(close_check(e.check_minutes))
     .bind(user_id)
     .bind(product_id)
+    .bind(e.buy_by)
+    .bind(e.buy_by.map(|day| buy_by_stage(day, now())).unwrap_or(0))
     .execute(db)
     .await?;
-    if let Some(minutes) = close_check(e.check_minutes).filter(|_| done.rows_affected() > 0) {
+    let pace = [close_check(e.check_minutes), buy_by_pace(e.buy_by, now())].into_iter().flatten().min();
+    if let Some(minutes) = pace.filter(|_| done.rows_affected() > 0) {
         check_within(db, user_id, product_id, minutes * 60).await?;
     }
     Ok(done.rows_affected() > 0)

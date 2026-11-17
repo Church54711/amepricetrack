@@ -1,0 +1,10 @@
+[Unit]
+Description=Update AmePriceTrack when its website asks for it
+
+[Path]
+# The "Update" button on the Settings page creates this file.
+PathExists=/var/lib/amepricetrack/update-requested
+Unit=amepricetrack-update.service
+
+[Install]
+WantedBy=multi-user.target

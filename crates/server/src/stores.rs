@@ -279,6 +279,10 @@ pub struct Location {
     /// The Walmart store whose prices the server last received. Walmart
     /// chooses it from the server's internet connection.
     pub walmart_store: Option<retailers::LocalStore>,
+    /// The Staples and Best Buy stores those chains chose for the server's
+    /// browser, from the ZIP code when one is set. Known after a price check.
+    pub staples_store: Option<retailers::LocalStore>,
+    pub bestbuy_store: Option<retailers::LocalStore>,
 }
 
 pub async fn location(db: &db::Db) -> anyhow::Result<Location> {
@@ -294,8 +298,14 @@ pub async fn location(db: &db::Db) -> anyhow::Result<Location> {
         }),
         None => None,
     };
-    let walmart_store = db::server_setting(db, "walmart_store").await?.and_then(|json| serde_json::from_str(&json).ok());
-    Ok(Location { zip, target_store, walmart_store })
+    let mut chosen = Vec::new();
+    for chain in ["walmart", "staples", "bestbuy"] {
+        chosen.push(db::server_setting(db, &format!("{chain}_store")).await?.and_then(|json| serde_json::from_str(&json).ok()));
+    }
+    let bestbuy_store = chosen.pop().flatten();
+    let staples_store = chosen.pop().flatten();
+    let walmart_store = chosen.pop().flatten();
+    Ok(Location { zip, target_store, walmart_store, staples_store, bestbuy_store })
 }
 
 /// Called at startup: read local-store prices from the saved location.
@@ -321,33 +331,66 @@ pub async fn set_location(app: &App, zip_text: &str) -> Result<String, Problem> 
         db::set_server_setting(&app.db, "zip", "").await?;
         db::set_server_setting(&app.db, "target_store", "").await?;
         app.fetcher.set_target_store(&app.cfg.target_store_id);
+        let others = tell_browser_stores(app, None).await;
         recheck_local_prices(app).await?;
-        return Ok("Location cleared. Target prices are read from the server's default store again.".into());
+        return Ok(format!("Location cleared. Target prices are read from the server's default store again.{others}"));
     }
     let zip = parse_zip(zip_text).ok_or_else(|| user_problem("Type a five-digit US ZIP code, such as 55403."))?;
     db::set_server_setting(&app.db, "zip", &zip).await?;
+    let others = tell_browser_stores(app, Some(&zip)).await;
     let nearest = match app.fetcher.target_stores_near(&zip).await {
         Ok(stores) => stores.into_iter().next(),
         Err(e) => {
+            recheck_local_prices(app).await?;
             return Err(user_problem(format!(
-                "The ZIP code was saved, but Target's store finder could not be reached ({e}). Target prices are unchanged; save again later."
-            )))
+                "The ZIP code was saved, but Target's store finder could not be reached ({e}). Target prices are unchanged; save again later.{others}"
+            )));
         }
     };
     let Some(store) = nearest else {
         db::set_server_setting(&app.db, "target_store", "").await?;
         app.fetcher.set_target_store(&app.cfg.target_store_id);
-        return Ok(format!("Saved {zip}. Target has no store within 100 miles, so its prices stay as they were."));
+        recheck_local_prices(app).await?;
+        return Ok(format!("Saved {zip}. Target has no store within 100 miles, so its prices stay as they were.{others}"));
     };
     db::set_server_setting(&app.db, "target_store", &serde_json::to_string(&store).map_err(anyhow::Error::from)?).await?;
     app.fetcher.set_target_store(&store.id);
     recheck_local_prices(app).await?;
-    Ok(format!("Saved {zip}. Target prices now come from the {} store.", store.name))
+    Ok(format!("Saved {zip}. Target prices now come from the {} store.{others}", store.name))
+}
+
+/// Gives Staples and Best Buy the ZIP code through the server's browser, so
+/// each uses its store nearest to it. Returns a sentence (with a leading
+/// space) for the person, or nothing when there is no browser to tell.
+async fn tell_browser_stores(app: &App, zip: Option<&str>) -> String {
+    if !app.fetcher.has_browser() {
+        return String::new();
+    }
+    match app.fetcher.tell_stores_zip(zip).await {
+        Ok(()) => {
+            // Which stores they choose shows after the next check of a product there.
+            for chain in ["staples", "bestbuy"] {
+                if let Err(e) = db::set_server_setting(&app.db, &format!("{chain}_store"), "").await {
+                    tracing::warn!("could not forget the {chain} store: {e:#}");
+                }
+            }
+            match zip {
+                Some(_) => " Staples and Best Buy now use their stores nearest to it.".into(),
+                None => " Staples and Best Buy choose a store by themselves again.".into(),
+            }
+        }
+        Err(e) => {
+            tracing::warn!("could not give the ZIP code to Staples and Best Buy: {e}");
+            format!(" Staples and Best Buy could not be told ({e}); save again later.")
+        }
+    }
 }
 
 /// Prices that depend on the local store are read again soon.
 async fn recheck_local_prices(app: &App) -> anyhow::Result<()> {
-    sqlx::query("UPDATE products SET next_check_at = 0 WHERE retailer = 'target'").execute(&app.db).await?;
+    sqlx::query("UPDATE products SET next_check_at = 0 WHERE retailer IN ('target', 'staples', 'bestbuy')")
+        .execute(&app.db)
+        .await?;
     app.wake.notify_one();
     Ok(())
 }

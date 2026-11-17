@@ -1,0 +1,91 @@
+name: Release
+
+# Pushing a tag such as v0.2.0 builds the server and the app and publishes
+# them as a release. The tag must match the version in crates/server/Cargo.toml.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    # Built on the oldest Ubuntu still supported, so it runs there and on anything newer.
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag against the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/server/Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Pack
+        run: |
+          name=amepricetrack-linux-${{ matrix.arch }}
+          mkdir -p "$name/deploy"
+          cp target/release/amepricetrack LICENSE "$name/"
+          cp deploy/* "$name/deploy/"
+          chmod 755 "$name/amepricetrack" "$name/deploy/install.sh"
+          "$name/amepricetrack" version
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.arch }}
+          path: amepricetrack-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Build the signed app
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.APT_KEYSTORE_BASE64 }}
+          APT_KEYSTORE_PASSWORD: ${{ secrets.APT_KEYSTORE_PASSWORD }}
+          APT_KEY_ALIAS: ${{ secrets.APT_KEY_ALIAS }}
+        run: |
+          [ -n "$KEYSTORE_BASE64" ] || { echo "The signing key is not set up (secret APT_KEYSTORE_BASE64)."; exit 1; }
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export APT_KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          ./gradlew --no-daemon testReleaseUnitTest assembleRelease
+          rm -f "$RUNNER_TEMP/release.jks"
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/AmePriceTrack.apk"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: AmePriceTrack.apk
+          if-no-files-found: error
+
+  publish:
+    needs: [server, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum amepricetrack-linux-*.tar.gz AmePriceTrack.apk > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes \
+            amepricetrack-linux-*.tar.gz AmePriceTrack.apk SHA256SUMS

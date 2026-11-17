@@ -244,6 +244,7 @@ async fn saving_other_settings_does_not_announce_a_met_target_again() {
         notify_back_in_stock: false,
         note: Some(note.to_string()),
         check_minutes: pace,
+        buy_by: None,
     };
     // A target the price already meets is announced once.
     db::update_watch(&app.db, user, id, &edit(4500, "", None)).await.unwrap();

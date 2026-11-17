@@ -29,6 +29,8 @@ data class Product(
     val seller: String? = null,
     /** True when that seller is not the store itself. */
     val thirdParty: Boolean? = null,
+    /** True when the chain's local store has it to collect today, false when not, null when the store does not say. */
+    val pickup: Boolean? = null,
 ) {
     val displayTitle: String get() = title ?: url
 }
@@ -41,6 +43,8 @@ data class WatchSettings(
     val note: String?,
     /** Check this product every so many minutes; null for the server's usual pace. */
     val checkMinutes: Int? = null,
+    /** The day to have bought it by, as the server keeps it: noon UTC of that day, in seconds. */
+    val buyBy: Long? = null,
 )
 
 data class Price(
@@ -213,6 +217,7 @@ fun parseProduct(o: JSONObject) = Product(
     itemNumber = o.text("retailer_sku"),
     seller = o.text("seller"),
     thirdParty = o.bool("third_party"),
+    pickup = o.bool("pickup"),
 )
 
 fun parseWatchItem(o: JSONObject): WatchItem {
@@ -229,6 +234,7 @@ fun parseWatchItem(o: JSONObject): WatchItem {
             notifyBackInStock = watch.optBoolean("notify_back_in_stock", false),
             note = watch.text("note"),
             checkMinutes = watch.long("check_minutes")?.toInt(),
+            buyBy = watch.long("buy_by"),
         ),
         price = Price(
             publicCents = price.long("public_cents"),
@@ -254,6 +260,110 @@ fun parseWatchItem(o: JSONObject): WatchItem {
 }
 
 fun parseWatchList(o: JSONObject): List<WatchItem> = o.optJSONArray("watches").mapObjects(::parseWatchItem)
+
+// ------------------------------------------------------------ buy-by day
+
+private const val DAY = 86_400L
+
+private fun utcFormat(pattern: String) =
+    java.text.SimpleDateFormat(pattern, Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+
+/** A buy-by day the way the server reads it: 2026-11-28. */
+fun dayText(buyBy: Long): String = utcFormat("yyyy-MM-dd").format(java.util.Date(buyBy * 1000))
+
+/** A buy-by day for a sentence: Nov 28. */
+fun shortDay(buyBy: Long): String = utcFormat("MMM d").format(java.util.Date(buyBy * 1000))
+
+/** Whole days from now until the buy-by day: 0 on the day, negative after it. */
+fun daysUntil(buyBy: Long, nowSeconds: Long): Long = Math.floorDiv(buyBy + DAY / 2 - nowSeconds, DAY)
+
+/** "Buy by Nov 28 (3 days)". */
+fun buyByText(buyBy: Long, nowSeconds: Long): String {
+    val left = daysUntil(buyBy, nowSeconds)
+    val how = when {
+        left < 0 -> " (passed)"
+        left == 0L -> " (today)"
+        left == 1L -> " (tomorrow)"
+        left <= 7 -> " ($left days)"
+        else -> ""
+    }
+    return "Buy by ${shortDay(buyBy)}$how"
+}
+
+/** A date picker gives the start of the chosen day in UTC, in milliseconds. */
+fun buyByFromPicker(millis: Long): Long = millis / 1000 + DAY / 2
+
+fun pickerMillis(buyBy: Long): Long = (buyBy - DAY / 2) * 1000
+
+// ------------------------------------------------------------ price chart
+
+/** The stretches of time a chart can show: what the button says, and the days. */
+val chartRanges: List<Pair<String, Int>> = listOf("1 month" to 30, "3 months" to 90, "1 year" to 365)
+
+/**
+ * The listed prices a chart draws for the time since [since] (seconds), oldest
+ * first: those inside it, and the price that already held when it began.
+ */
+fun chartPoints(history: List<PricePoint>, since: Long?): List<PricePoint> {
+    val listed = history.filter { !it.member }.sortedBy { it.ts }
+    if (since == null) return listed
+    val held = listed.lastOrNull { it.ts < since }?.copy(ts = since)
+    return listOfNotNull(held) + listed.filter { it.ts >= since }
+}
+
+// ------------------------------------------------------------ the widget
+
+/** One line of the home-screen widget. */
+data class DealRow(
+    val productId: Long,
+    val title: String,
+    val store: String,
+    val price: String,
+    /** Why it is worth a look, when it is. */
+    val note: String?,
+    val good: Boolean,
+)
+
+/**
+ * The watchlist as the widget shows it: what has reached its target first,
+ * then what is at its lowest, then the biggest drops below the usual price.
+ */
+fun dealRows(items: List<WatchItem>, limit: Int = 12, nowSeconds: Long = System.currentTimeMillis() / 1000): List<DealRow> {
+    data class Ranked(val row: DealRow, val rank: Int, val below: Double)
+    return items.mapNotNull { item ->
+        val yours = item.price.yourCents ?: return@mapNotNull null
+        val target = item.watch.targetPriceCents
+        val below = item.deal.percentBelow?.takeIf { it >= 1.0 }
+        val (rank, note) = when {
+            // Nothing to buy: it goes last, whatever its price.
+            item.product.inStock == false -> -1 to "Out of stock"
+            target != null && yours <= target -> 3 to "Target reached"
+            item.deal.atLowest -> 2 to "Lowest recorded"
+            below != null -> 1 to "${below.toInt()}% below " + if (item.deal.comparedTo == "average") "usual" else "list price"
+            else -> 0 to item.watch.buyBy?.takeIf { daysUntil(it, nowSeconds) in 0..7 }?.let { buyByText(it, nowSeconds) }
+        }
+        Ranked(DealRow(item.product.id, item.product.displayTitle, item.storeName, dollars(yours), note, rank > 0), rank, if (rank > 0) below ?: 0.0 else 0.0)
+    }.sortedWith(compareByDescending<Ranked> { it.rank }.thenByDescending { it.below }).take(limit).map { it.row }
+}
+
+fun dealRowsToJson(rows: List<DealRow>): String = JSONArray().apply {
+    rows.forEach { row ->
+        put(
+            JSONObject().put("id", row.productId).put("title", row.title).put("store", row.store).put("price", row.price)
+                .put("note", row.note ?: JSONObject.NULL).put("good", row.good),
+        )
+    }
+}.toString()
+
+fun dealRowsFromJson(text: String?): List<DealRow> {
+    if (text.isNullOrEmpty()) return emptyList()
+    val array = try {
+        JSONArray(text)
+    } catch (e: Exception) {
+        return emptyList()
+    }
+    return array.mapObjects { DealRow(it.optLong("id"), it.optString("title"), it.optString("store"), it.optString("price"), it.text("note"), it.optBoolean("good")) }
+}
 
 fun parseProductDetail(o: JSONObject) = ProductDetail(
     item = parseWatchItem(o),

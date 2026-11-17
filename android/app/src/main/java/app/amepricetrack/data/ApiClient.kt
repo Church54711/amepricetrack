@@ -121,6 +121,8 @@ class ApiClient(
             .put("notify_back_in_stock", settings.notifyBackInStock)
             .put("note", settings.note ?: JSONObject.NULL)
             .put("check_minutes", settings.checkMinutes ?: JSONObject.NULL)
+            // An empty day means none; leaving the field out would keep the old one.
+            .put("buy_by", settings.buyBy?.let(::dayText).orEmpty())
         return parseWatchItem(call("POST", "products/$id/watch", body))
     }
 
@@ -183,6 +185,14 @@ class ApiClient(
     }
 
     private fun encode(text: String): String = URLEncoder.encode(text, "UTF-8")
+
+    /** The server's version, and whether a newer one can be installed from here. */
+    suspend fun serverUpdate(): ServerUpdate = parseServerUpdate(call("GET", "update"))
+
+    /** Has the server install the latest release. It restarts about a minute later. */
+    suspend fun updateServer() {
+        call("POST", "update")
+    }
 
     suspend fun chat(message: String): String = call("POST", "chat", JSONObject().put("message", message)).optString("reply")
 }

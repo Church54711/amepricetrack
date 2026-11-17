@@ -23,6 +23,8 @@ pub fn routes() -> Router<App> {
         .route("/api/v1/watches", get(list_watches).post(add_watch))
         .route("/api/v1/products/{id}", get(product))
         .route("/api/v1/products/{id}/watch", post(update_watch).delete(remove_watch))
+        .route("/api/v1/products/{id}/history.csv", get(history_csv))
+        .route("/api/v1/products/{id}/history", post(import_history))
         .route("/api/v1/products/{id}/check", post(check_now))
         .route("/api/v1/products/{id}/compare", post(compare_now))
         .route("/api/v1/comparisons/{id}", post(decide_comparison))
@@ -35,6 +37,7 @@ pub fn routes() -> Router<App> {
         .route("/api/v1/chat", post(chat))
         .route("/api/v1/push", get(push_settings).post(set_push))
         .route("/api/v1/push/test", post(test_push))
+        .route("/api/v1/update", get(update_state).post(update_server))
         // A phone sends product pages compressed, which is a fraction of the upload.
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
 }
@@ -170,6 +173,8 @@ struct WatchBody {
     note: Option<String>,
     /// Check this product every so many minutes; leave out for the server's usual pace.
     check_minutes: Option<i64>,
+    /// The day to have bought it by, as "2026-11-28"; "" for none. Left out, the day stays as it is.
+    buy_by: Option<String>,
 }
 
 fn yes() -> bool {
@@ -193,7 +198,12 @@ async fn update_watch(
         ))
         .into());
     }
+    let buy_by = match &body.buy_by {
+        Some(day) => service::buy_by_day(day)?,
+        None => db::watch(&app.db, user.id, id).await?.and_then(|w| w.buy_by),
+    };
     let edit = WatchEdit {
+        buy_by,
         target_price_cents: body.target_price_cents.filter(|c| *c > 0),
         drop_percent: body.drop_percent,
         notify_any_drop: body.notify_any_drop,
@@ -215,6 +225,32 @@ async fn remove_watch(State(app): State<App>, CurrentUser(user): CurrentUser, Pa
         return Err(not_found());
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// The product's price history as a CSV file.
+async fn history_csv(State(app): State<App>, CurrentUser(user): CurrentUser, Path(id): Path<i64>) -> Result<Response, ApiError> {
+    if db::watch(&app.db, user.id, id).await?.is_none() {
+        return Err(not_found());
+    }
+    let csv = crate::history::to_csv(&db::history(&app.db, id, user.id).await?);
+    Ok(([(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")], csv).into_response())
+}
+
+#[derive(Deserialize)]
+struct PastPricesBody {
+    /// Lines of "date, price" from before tracking started, as text.
+    prices: String,
+}
+
+async fn import_history(
+    State(app): State<App>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<i64>,
+    Json(body): Json<PastPricesBody>,
+) -> ApiResult {
+    let points = crate::history::parse_pasted(&body.prices, db::now()).map_err(service::user_problem)?;
+    let added = crate::history::import(&app, user.id, id, points).await?;
+    Ok(Json(json!({ "added": added })))
 }
 
 async fn check_now(State(app): State<App>, CurrentUser(user): CurrentUser, Path(id): Path<i64>) -> ApiResult {
@@ -375,6 +411,27 @@ async fn set_push(State(app): State<App>, CurrentUser(user): CurrentUser, Json(b
 
 async fn test_push(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiResult {
     service::send_test_push(&app, user.id).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The server's version, and whether a newer one has been published. Only
+/// the administrator is told about new versions and can install them.
+async fn update_state(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiResult {
+    let newer = crate::update::known_newer().filter(|_| user.is_admin);
+    Ok(Json(json!({
+        "version": crate::update::current(),
+        "newer": newer,
+        "can_install": user.is_admin && crate::update::can_install(&app),
+        "last": crate::update::status().filter(|_| user.is_admin),
+    })))
+}
+
+/// Has the machine install the latest release. The server restarts about a minute later.
+async fn update_server(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiResult {
+    if !user.is_admin {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Only the administrator can update the server.".into()));
+    }
+    crate::update::request(&app).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

@@ -1,12 +1,67 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- A gold "A" on black, matching the default OLED Black and Gold theme. -->
+<!-- The project's mark (assets/logo-mark.svg): a price tag with a gold "A"
+     whose crossbar is a price stepping down. Drawn in the mark's own 256
+     grid and scaled into the part of the icon no launcher shape cuts off. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <path
-        android:fillColor="#E8B923"
-        android:fillType="evenOdd"
-        android:pathData="M49,33 L59,33 L76,75 L66.5,75 L62.9,65.5 L45.1,65.5 L41.5,75 L32,75 Z M54,42.5 L48.1,57.8 L59.9,57.8 Z" />
+    <group
+        android:scaleX="0.234375"
+        android:scaleY="0.234375"
+        android:translateX="24"
+        android:translateY="24">
+        <path
+            android:fillColor="#000000"
+            android:pathData="M56,12H170L244,86V200a44,44 0,0 1,-44 44H56a44,44 0,0 1,-44 -44V56a44,44 0,0 1,44 -44Z"
+            android:strokeLineJoin="round"
+            android:strokeWidth="6">
+            <aapt:attr name="android:strokeColor">
+                <gradient android:endX="232" android:endY="232" android:startX="24" android:startY="24" android:type="linear">
+                    <item android:color="#FFE27A" android:offset="0" />
+                    <item android:color="#E8B923" android:offset="0.45" />
+                    <item android:color="#B07D0A" android:offset="1" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:pathData="M175,70a11,11 0,1 0,22 0a11,11 0,1 0,-22 0"
+            android:strokeWidth="6">
+            <aapt:attr name="android:strokeColor">
+                <gradient android:endX="232" android:endY="232" android:startX="24" android:startY="24" android:type="linear">
+                    <item android:color="#FFE27A" android:offset="0" />
+                    <item android:color="#E8B923" android:offset="0.45" />
+                    <item android:color="#B07D0A" android:offset="1" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:pathData="M58,204 122,60 186,204"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:strokeWidth="26">
+            <aapt:attr name="android:strokeColor">
+                <gradient android:endX="232" android:endY="232" android:startX="24" android:startY="24" android:type="linear">
+                    <item android:color="#FFE27A" android:offset="0" />
+                    <item android:color="#E8B923" android:offset="0.45" />
+                    <item android:color="#B07D0A" android:offset="1" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path
+            android:pathData="M86,140H112L132,168H170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:strokeWidth="13">
+            <aapt:attr name="android:strokeColor">
+                <gradient android:endX="232" android:endY="232" android:startX="24" android:startY="24" android:type="linear">
+                    <item android:color="#FFE27A" android:offset="0" />
+                    <item android:color="#E8B923" android:offset="0.45" />
+                    <item android:color="#B07D0A" android:offset="1" />
+                </gradient>
+            </aapt:attr>
+        </path>
+    </group>
 </vector>

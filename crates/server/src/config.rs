@@ -35,6 +35,11 @@ pub struct Config {
     /// topic or webhook at an address on the home network.
     /// `APT_MEMBERS_LOCAL_NETWORK=1`; off by default.
     pub members_local_network: bool,
+    /// Look for a newer version once in a while. `APT_UPDATE_CHECK=0` turns it off.
+    pub update_check: bool,
+    /// Creating this file asks the machine to install the latest release.
+    /// `APT_UPDATE_REQUEST`, set by the service file `deploy/install.sh` installs.
+    pub update_request: Option<PathBuf>,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -83,6 +88,8 @@ impl Config {
             browser_args: env("APT_BROWSER_ARGS").map(|a| split_args(&a)).unwrap_or_default(),
             target_store_id: env("APT_TARGET_STORE_ID").unwrap_or_else(|| "1375".into()),
             secure_cookies: env("APT_SECURE_COOKIES").is_some_and(|v| v != "0"),
+            update_check: env("APT_UPDATE_CHECK").is_none_or(|v| v != "0"),
+            update_request: env("APT_UPDATE_REQUEST").map(PathBuf::from),
         })
     }
 }

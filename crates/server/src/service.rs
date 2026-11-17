@@ -191,6 +191,29 @@ pub async fn rebaseline(app: &App, user_id: i64, retailer: &str) -> Result<(), P
     Ok(())
 }
 
+/// Reads a buy-by day typed as 2026-11-28 (what a date field sends). Empty means none.
+/// The day is kept as noon UTC, which is that same day everywhere in the Americas.
+pub fn buy_by_day(text: &str) -> Result<Option<i64>, Problem> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    let day = time::Date::parse(text, format).map_err(|_| user_problem("Write the buy-by day as a date, such as 2026-11-28."))?;
+    let noon = day.midnight().assume_utc().unix_timestamp() + db::DAY / 2;
+    match db::days_until(noon, db::now()) {
+        d if d < 0 => Err(user_problem("The buy-by day has already passed. Choose today or a later day.")),
+        d if d > 730 => Err(user_problem("The buy-by day is more than two years away.")),
+        _ => Ok(Some(noon)),
+    }
+}
+
+/// A buy-by day as the text a date field shows: 2026-11-28.
+pub fn day_text(ts: i64) -> String {
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    time::OffsetDateTime::from_unix_timestamp(ts).ok().and_then(|d| d.format(format).ok()).unwrap_or_default()
+}
+
 // ------------------------------------------------------------ pushed alerts
 
 /// Checks a web address a person typed for pushing alerts to. Empty stays empty.
