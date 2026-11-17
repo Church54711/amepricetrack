@@ -494,3 +494,28 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .inline-forms { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 4px; font-size: 0.87rem; }
 .inline-forms form { margin: 0; }
 td.muted { color: var(--muted); }
+
+/* ---------- find a product ---------- */
+
+.find-store { padding: 14px 0; border-top: 1px solid var(--border); }
+.find-store:first-child { padding-top: 0; border-top: none; }
+.find-store:last-child { padding-bottom: 0; }
+.find-store h2 { margin-bottom: 6px; }
+.find-item { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 6px 0; }
+.find-item a { min-width: 0; overflow-wrap: anywhere; }
+.find-item form { margin: 0; flex: none; }
+.find-results p { margin: 0; }
+
+/* ---------- price match ---------- */
+
+.match-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+@media (max-width: 640px) { .match-grid { grid-template-columns: minmax(0, 1fr); } }
+.match-side { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; background: var(--surface-2); }
+.match-side.better { border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }
+.match-side > * { margin-bottom: 10px; }
+.match-side > :last-child { margin-bottom: 0; }
+.match-label { color: var(--muted); font-size: 0.85rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.match-title { font-weight: 600; overflow-wrap: anywhere; }
+.checks { margin: 0 0 14px; padding-left: 20px; }
+.checks li { margin-bottom: 4px; }
+.checks li.warn { color: var(--warn); }

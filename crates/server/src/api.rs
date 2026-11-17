@@ -26,6 +26,8 @@ pub fn routes() -> Router<App> {
         .route("/api/v1/products/{id}/check", post(check_now))
         .route("/api/v1/products/{id}/compare", post(compare_now))
         .route("/api/v1/comparisons/{id}", post(decide_comparison))
+        .route("/api/v1/comparisons/{id}/refresh", post(refresh_comparison))
+        .route("/api/v1/find", get(find))
         .route("/api/v1/notifications", get(notifications))
         .route("/api/v1/notifications/read", post(mark_read))
         .route("/api/v1/collect", get(collect))
@@ -233,6 +235,44 @@ async fn decide_comparison(
     }
 }
 
+/// Checks both sides of a comparison again now, before asking for a price match.
+async fn refresh_comparison(State(app): State<App>, CurrentUser(user): CurrentUser, Path(id): Path<i64>) -> ApiResult {
+    let row: Option<(i64, Option<i64>)> =
+        sqlx::query_as("SELECT source_product_id, product_id FROM comparisons WHERE id = ? AND user_id = ?")
+            .bind(id)
+            .bind(user.id)
+            .fetch_optional(&app.db)
+            .await
+            .map_err(Problem::from)?;
+    let Some((source, other)) = row else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "That comparison does not exist.".into()));
+    };
+    for product_id in [Some(source), other].into_iter().flatten() {
+        db::check_soon(&app.db, product_id).await?;
+    }
+    app.wake.notify_one();
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct FindQuery {
+    /// A product name, or a barcode number.
+    q: String,
+    /// Without a store: the tidied query, the stores to ask and what is
+    /// already tracked. With one: that store's first results.
+    store: Option<String>,
+}
+
+async fn find(State(app): State<App>, CurrentUser(user): CurrentUser, Query(q): Query<FindQuery>) -> ApiResult {
+    match q.store.as_deref() {
+        None => Ok(Json(crate::find::start(&app, user.id, &q.q).await?)),
+        Some(store) => {
+            let query = crate::find::query(&q.q)?;
+            Ok(Json(json!(crate::find::at_store(&app, &query, store).await?)))
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct AfterQuery {
     /// Only alerts newer than this id. The app remembers the highest id it has shown.
@@ -264,6 +304,7 @@ async fn collect(State(app): State<App>, CurrentUser(user): CurrentUser) -> ApiR
         let entry = json!({
             "product_id": p.id,
             "store": p.retailer,
+            "fail_count": p.fail_count,
             "store_name": retailers::display_name(&p.retailer),
             "url": p.url,
             "title": p.display_title(),

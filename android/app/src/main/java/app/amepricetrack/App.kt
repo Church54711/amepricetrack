@@ -4,6 +4,7 @@ import android.app.Application
 import app.amepricetrack.data.ApiClient
 import app.amepricetrack.data.Session
 import app.amepricetrack.work.AlertWorker
+import app.amepricetrack.work.ReportWorker
 
 class App : Application() {
     lateinit var session: Session
@@ -16,6 +17,9 @@ class App : Application() {
         session = Session(this)
         api = ApiClient(serverUrl = { session.state.value.serverUrl }, token = { session.state.value.token })
         AlertWorker.createChannel(this)
-        if (session.state.value.signedIn) AlertWorker.schedule(this)
+        if (session.state.value.signedIn) {
+            AlertWorker.schedule(this)
+            ReportWorker.schedule(this, session.autoReport)
+        }
     }
 }

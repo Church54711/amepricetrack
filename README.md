@@ -27,9 +27,20 @@ checking. Data lives in a single SQLite file.
   as that person's own price.
 - **Deals page** ranking tracked items by how far below their usual price
   they are (90-day average, or the store's regular price while history is short).
+- **Find by name or barcode.** Type a product's name or the number under its
+  barcode instead of a link (the phone app can scan the barcode), and pick
+  the right result from each store's own search.
 - **Compares stores for you.** Paste one link and the same product is looked
   up at every other store, matched by barcode or model number, and kept up
   to date. You are told when another store is cheaper.
+- **Compares what it really costs.** Delivery charges count, marketplace
+  sellers on Amazon and Walmart are named, and the same item in another pack
+  size (a ream against a carton, a single against a 3-pack) is compared for
+  the same amount.
+- **Price match card.** When another store is cheaper, one page shows both
+  listings side by side with what to check, ready to show at the register.
+- **Tells you when a store stops working.** If nothing at a store could be
+  read for two days you get an alert, and another when it reads again.
 - **AI assistant** that sees your watchlist, and helps with matching: it
   picks the right search results and judges listings that no barcode
   settles. Works with Claude, OpenAI, DeepSeek, Gemini, OpenRouter, Ollama,
@@ -93,6 +104,55 @@ small, inexpensive model is the right choice. Settings has a separate
 "Model for matching products" so the assistant can keep a larger one; with
 Claude, `claude-haiku-5-5` works well.
 
+### What is compared
+
+Two prices are only worth comparing when they buy the same thing, delivered.
+
+- **Delivery.** Amazon and Walmart pages say whether delivery is free or what
+  it costs. A stated charge is added to that store's price. When a page only
+  says delivery is charged, the listing is marked "plus delivery" rather
+  than guessed at. If a membership gives you free delivery (Prime,
+  Walmart+), add it on the Discounts page with "Free delivery" ticked; it
+  covers what the store ships itself. Delivery is not read at the other stores.
+- **Marketplace sellers.** Amazon and Walmart also list other sellers'
+  offers. The seller is shown on the product page and named in the alert.
+  Settings has "Leave marketplace sellers out" for people who never want
+  those offers to count as the best price.
+- **Pack sizes.** When two listings are the same item in different amounts
+  ("500 Sheets" against "5000 Sheets", "8 Count" against "24 Count"), the
+  other store's price is worked out for the amount you track, and the page
+  shows both figures. Only counts are treated this way (sheets, reams,
+  packs, counts, rolls, pairs). A different size of the item itself, such as
+  a 12 oz bottle against a 24 oz one, stays a different product.
+
+### Price match card
+
+On a product page, a store that is cheaper for the identical item has a
+"Price match card" link. The card shows your store's listing and the other
+store's side by side (name, price, model, barcode, item number), when the
+other price was read, a button to open the live listing, and anything that
+may get a match refused: a marketplace seller, an out-of-stock item, a
+delivery charge, or a match only your AI vouches for. "Check both prices
+again" re-reads both pages. Price-match rules differ by store and change;
+the card does not know them.
+
+### Checking the AI's matching
+
+The server ships with a set of listing pairs whose answers are known: the
+same product worded two ways, near-identical variants, other colours and
+generations, bundles, refurbished items, and other pack sizes.
+
+```sh
+APT_AI_PROVIDER=claude APT_AI_KEY=... APT_AI_MODEL=claude-haiku-5-5 amepricetrack judge-test
+```
+
+It reports how many the model got right, how many it wrongly called the same
+(the mistake that causes false alerts), how many matches it missed and how
+many it left undecided, and exits with an error if any were wrongly called
+the same. Pass a file of your own pairs as an argument; the format is in
+`crates/server/tests/matching_cases.json`. The same pairs are run against
+the rules alone in the test suite.
+
 Your own discounts apply per store, so a Staples price after the employee
 discount is compared with the other stores' prices fairly. Looking a product
 up costs a few page loads per store, once; after that only the matches are
@@ -110,9 +170,10 @@ Set `APT_AI_PROVIDER` (for example `claude`), `APT_AI_KEY` and `APT_AI_MODEL`
 in the environment to try that command with the AI's help.
 
 Known limits: Kohl's, Harbor Freight and Hot Topic mostly sell their own or
-exclusive items, so they rarely match; without an AI service, Amazon and
-Walmart marketplace listings of multi-packs can show up as "possibly the
-same" at an odd price; a store with colour options on one page (Target) is
+exclusive items, so they rarely match; a listing that does not state its
+pack size in its name is taken to hold the same amount unless an AI service
+says otherwise; Walmart does not state the delivery charge on orders under
+its free-delivery minimum, only that there is one; a store with colour options on one page (Target) is
 matched as a whole listing, not per colour; and the AI can be wrong, most
 often when a product page says too little to tell near-identical variants
 apart.
@@ -216,6 +277,12 @@ username and password as the website and uses the same theme.
   other stores' prices, and alert settings.
 - **Add by sharing**: in a store's app or a browser, choose Share, then
   "Track price". Or paste a link with the + button.
+- **Find by name or barcode**: type a name with the + button, or scan a
+  product's barcode, and pick the right result from each store. The scanner
+  is the one built into Google Play services, so the app asks for no camera
+  permission; without Play services, type the number under the barcode.
+- **Price match card**: the same card as on the website, sized for showing
+  at a register.
 - **Notifications**: the app asks the server for new alerts about every 15
   minutes (the shortest interval Android allows in the background).
 - **Prices from this phone**: the app opens product pages in its own
@@ -223,6 +290,10 @@ username and password as the website and uses the same theme.
   or pick your local store, and its prices are kept as your own. This is how
   member and employee prices, your own Walmart store, and stores the server
   cannot read get in. Store passwords and sign-ins stay on the phone.
+  The phone also does this by itself, twice a day by default (Settings: off,
+  daily or twice a day), for the products the server cannot read and the
+  ones at stores you opened in the app. It reads at most 40 pages a run and
+  needs a network connection and a battery that is not low.
 - **Assistant**: ask the connected AI about your tracked prices.
 
 Build it with Android Studio, or from a terminal with a JDK (17 or newer)
@@ -253,6 +324,9 @@ except `login`.
 | `POST products/{id}/check` | Check now. |
 | `POST products/{id}/compare` | Search the other stores for this product (again). Results arrive in `other_stores` of `GET products/{id}`; `judged_by` is `ai` for matches the AI made. |
 | `POST comparisons/{id}` `{same}` | Confirm or reject a possible match. |
+| `POST comparisons/{id}/refresh` | Read both sides of a comparison again now. |
+| `GET find?q=` | Start a find by name or barcode: the tidied query, the stores to ask, and matches already tracked. |
+| `GET find?q=&store=` | One store's first results (`title`, `url`); pass a `url` to `POST watches` to track it. |
 | `GET notifications?after={id}`, `POST notifications/read` | Alerts. |
 | `GET collect` | Pages the server cannot read itself and wants the device to load. |
 | `POST ingest` `{url, html, signed_in}` | A product page loaded on the device. |
@@ -269,9 +343,11 @@ crates/server/src
   fetch.rs       plain requests, per-store pacing, choosing a reader
   compare/       finding the same product at other stores (search, matching, AI help, tracking)
   stores.rs      stores people add, and the server's location
+  find.rs        finding a product by name or barcode
+  health.rs      noticing when a whole store stops being readable
   browser.rs     driving Chrome
   scheduler.rs   the background checking loop
-  pricing.rs     discounts, personal price, averages
+  pricing.rs     discounts, delivery, personal price, averages
   alerts.rs      when to alert, ntfy and webhook delivery
   ai.rs          AI services
   service.rs     actions shared by the site and the API

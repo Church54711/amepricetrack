@@ -61,6 +61,21 @@ class Session(context: Context) {
         get() = prefs.getBoolean("alerts_started", false)
         set(value) = prefs.edit().putBoolean("alerts_started", value).apply()
 
+    /** How often the phone reports prices by itself: "off", "daily" or "twice" (a day). */
+    var autoReport: String
+        get() = prefs.getString("auto_report", null) ?: "twice"
+        set(value) = prefs.edit().putString("auto_report", value).apply()
+
+    /** When the phone last reported prices by itself, in milliseconds; 0 for never. */
+    var lastReportAt: Long
+        get() = prefs.getLong("last_report_at", 0)
+        set(value) = prefs.edit().putLong("last_report_at", value).apply()
+
+    /** What the last automatic report did, in words. */
+    var lastReportSummary: String?
+        get() = prefs.getString("last_report_summary", null)
+        set(value) = prefs.edit().putString("last_report_summary", value).apply()
+
     /** Stores the person opened in the in-app browser, where they may be signed in. */
     var visitedStores: Set<String>
         get() = prefs.getStringSet("visited_stores", emptySet()) ?: emptySet()

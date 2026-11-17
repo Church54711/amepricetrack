@@ -48,14 +48,17 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.ui.platform.LocalContext
 import app.amepricetrack.App
 import app.amepricetrack.data.WatchItem
 import app.amepricetrack.data.dollars
+import app.amepricetrack.data.looksLikeLink
 import coil.compose.AsyncImage
 import kotlinx.coroutines.launch
 
 @Composable
-fun WatchlistScreen(app: App, version: Int, onOpen: (Long) -> Unit, onMessage: (String) -> Unit) {
+fun WatchlistScreen(app: App, version: Int, onOpen: (Long) -> Unit, onFind: (String) -> Unit, onMessage: (String) -> Unit) {
     var state by remember { mutableStateOf<Load<List<WatchItem>>>(Load.Loading) }
     var refreshing by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
@@ -97,7 +100,10 @@ fun WatchlistScreen(app: App, version: Int, onOpen: (Long) -> Unit, onMessage: (
                         item {
                             Card {
                                 SectionTitle("Nothing tracked yet")
-                                Muted("Tap + and paste a product link, or use Share in a store's app or your browser and choose “Track price”.")
+                                Muted(
+                                    "Tap + to paste a product link, type a product's name, or scan its barcode. " +
+                                        "You can also use Share in a store's app or your browser and choose “Track price”.",
+                                )
                             }
                         }
                     }
@@ -122,16 +128,18 @@ fun WatchlistScreen(app: App, version: Int, onOpen: (Long) -> Unit, onMessage: (
                 scope.launch { load() }
                 onOpen(it)
             },
+            onFind = {
+                adding = false
+                onFind(it)
+            },
         )
     }
 }
 
-/** Looks like a link to a product page rather than some other copied text. */
-private fun looksLikeLink(text: String): Boolean = text.length < 2000 && Regex("""https?://\S+""").containsMatchIn(text)
-
 @Composable
-private fun AddDialog(app: App, onDismiss: () -> Unit, onAdded: (Long) -> Unit) {
+private fun AddDialog(app: App, onDismiss: () -> Unit, onAdded: (Long) -> Unit, onFind: (String) -> Unit) {
     val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     // A link already on the clipboard is offered, since that is the usual way here.
     var link by remember { mutableStateOf(clipboard.getText()?.text?.trim()?.takeIf(::looksLikeLink).orEmpty()) }
     var problem by remember { mutableStateOf<String?>(null) }
@@ -146,19 +154,27 @@ private fun AddDialog(app: App, onDismiss: () -> Unit, onAdded: (Long) -> Unit) 
                 OutlinedTextField(
                     value = link,
                     onValueChange = { link = it },
-                    label = { Text("Product link") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    label = { Text("Product link, name or barcode") },
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 problem?.let { Text(it, color = LocalPalette.current.bad) }
-                Muted("Paste the link of a product page from any supported store.")
+                Muted("Paste the link of a product page, or type a name or the number under a barcode to look it up at each store.")
+                OutlinedButton(
+                    enabled = !busy,
+                    onClick = { scanBarcode(context, onCode = onFind, onProblem = { problem = it }) },
+                ) { Text("Scan a barcode") }
             }
         },
         confirmButton = {
             TextButton(
                 enabled = !busy && link.isNotBlank(),
                 onClick = {
+                    // A name or a barcode rather than a link: look it up at the stores.
+                    if (!looksLikeLink(link)) {
+                        onFind(link.trim())
+                        return@TextButton
+                    }
                     busy = true
                     problem = null
                     scope.launch {
@@ -168,7 +184,7 @@ private fun AddDialog(app: App, onDismiss: () -> Unit, onAdded: (Long) -> Unit) 
                         result.onFailure { problem = result.problem() }
                     }
                 },
-            ) { Text(if (busy) "Adding…" else "Track") }
+            ) { Text(if (busy) "Adding…" else if (link.isBlank() || looksLikeLink(link)) "Track" else "Find") }
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
     )
@@ -205,7 +221,10 @@ fun Badges(item: WatchItem) {
         if (item.price.memberCents != null) Tag("Your signed-in price", TagKind.Member)
         item.price.discountName?.let { Tag(it, TagKind.Member) }
         val yours = item.price.yourCents
-        item.elsewhere?.takeIf { yours != null && it.cents < yours }?.let { Tag("${dollars(it.cents)} at ${it.storeName}", TagKind.Warn) }
+        // Compared with delivery included on both sides.
+        val total = item.price.totalCents
+        item.elsewhere?.takeIf { total != null && it.cents < total }?.let { Tag("${dollars(it.cents)} at ${it.storeName}", TagKind.Warn) }
+        if (p.thirdParty == true) Tag("Marketplace seller", TagKind.Warn)
         val target = item.watch.targetPriceCents
         if (target != null && yours != null && yours <= target) Tag("Target reached", TagKind.Good)
         if (p.currentPriceCents == null && p.lastError != null) Tag("Could not read price", TagKind.Bad)

@@ -31,6 +31,10 @@ pub async fn run(app: App) {
             if let Err(e) = expired {
                 tracing::warn!("could not remove expired sign-ins: {e:#}");
             }
+            // Tell people when a whole store has stopped being readable.
+            if let Err(e) = crate::health::check(&app).await {
+                tracing::warn!("could not check the stores' health: {e:#}");
+            }
         }
 
         // Sleep until something is due, or until someone adds a product or presses "check now".

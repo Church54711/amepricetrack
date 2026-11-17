@@ -12,6 +12,8 @@ mod compare;
 mod config;
 mod db;
 mod fetch;
+mod find;
+mod health;
 mod pricing;
 mod retailers;
 mod scheduler;
@@ -83,6 +85,19 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // `amepricetrack parse <store> <file>` shows what the server reads from a saved product page.
+    if args.get(1).map(String::as_str) == Some("parse") {
+        let (Some(store), Some(file)) = (args.get(2), args.get(3)) else {
+            anyhow::bail!("usage: amepricetrack parse <store> <saved page>");
+        };
+        println!("{:#?}", retailers::parse(store, &std::fs::read_to_string(file)?)?);
+        return Ok(());
+    }
+    // `amepricetrack judge-test [file]` runs the pairs with known answers past the AI model
+    // named by APT_AI_PROVIDER, APT_AI_KEY and APT_AI_MODEL, and reports how it did.
+    if args.get(1).map(String::as_str) == Some("judge-test") {
+        return judge_test(args.get(2).map(String::as_str)).await;
+    }
     // `amepricetrack search <store> <words...>` lists the product links a store's search returns.
     if args.get(1).map(String::as_str) == Some("search") {
         let store = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: amepricetrack search <store> <words>"))?;
@@ -147,16 +162,8 @@ async fn compare_once(cfg: &config::Config, link: &str, only: Option<&str>) -> a
             source.price_cents,
         )
     };
-    let env = |name: &str| std::env::var(name).unwrap_or_default();
-    let ai_settings = db::Settings {
-        ai_provider: env("APT_AI_PROVIDER"),
-        ai_api_key: env("APT_AI_KEY"),
-        ai_model: env("APT_AI_MODEL"),
-        ai_base_url: env("APT_AI_BASE_URL"),
-        ..Default::default()
-    };
     let http = reqwest::Client::builder().user_agent("AmePriceTrack").build()?;
-    let advisor = match ai::AiConfig::for_matching(&ai_settings) {
+    let advisor = match ai_from_env() {
         Ok(ai) => {
             println!("With help from the AI model {}", ai.model);
             Some(compare::advisor::Advisor::new(&http, ai))
@@ -181,15 +188,30 @@ async fn compare_once(cfg: &config::Config, link: &str, only: Option<&str>) -> a
     for store in compare::search::builtin().iter().filter(wanted) {
         let name = &store.name;
         match compare::find_at_store(&fetcher, &facts, store, advisor.as_ref()).await {
-            StoreResult::Found(found) => println!(
-                "{name}: {} | {}{} ({}%)\n  {}\n  {}",
-                price(found.obs.price_cents),
-                if found.by_ai { "AI: " } else { "" },
-                found.reason,
-                found.score,
-                found.obs.title.as_deref().unwrap_or(&found.candidate.title),
-                found.candidate.url,
-            ),
+            StoreResult::Found(found) => {
+                println!(
+                    "{name}: {} | {}{} ({}%)\n  {}\n  {}",
+                    price(found.obs.price_cents),
+                    if found.by_ai { "AI: " } else { "" },
+                    found.reason,
+                    found.score,
+                    found.obs.title.as_deref().unwrap_or(&found.candidate.title),
+                    found.candidate.url,
+                );
+                if let Some(pack) = &found.pack {
+                    println!(
+                        "  another amount: {} there, {} here",
+                        compare::matching::amount_text(pack.other_qty, &pack.unit),
+                        compare::matching::amount_text(pack.source_qty, &pack.unit)
+                    );
+                }
+                if let Some(seller) = &found.obs.seller {
+                    println!(
+                        "  sold by {seller} (marketplace seller: {:?}), free delivery: {:?}",
+                        found.obs.third_party, found.obs.ships_free
+                    );
+                }
+            }
             StoreResult::NotFound(Some(note)) => println!("{name}: not found ({note})"),
             StoreResult::NotFound(None) => println!("{name}: not found"),
             StoreResult::Failed(why) => println!("{name}: could not search ({why})"),
@@ -197,6 +219,78 @@ async fn compare_once(cfg: &config::Config, link: &str, only: Option<&str>) -> a
     }
     if let Some(browser) = fetcher.browser() {
         browser.shutdown().await;
+    }
+    Ok(())
+}
+
+/// The AI service described by the APT_AI_* environment variables, set up for matching.
+fn ai_from_env() -> anyhow::Result<ai::AiConfig> {
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
+    let settings = db::Settings {
+        ai_provider: env("APT_AI_PROVIDER"),
+        ai_api_key: env("APT_AI_KEY"),
+        ai_model: env("APT_AI_MODEL"),
+        ai_base_url: env("APT_AI_BASE_URL"),
+        ..Default::default()
+    };
+    ai::AiConfig::for_matching(&settings)
+}
+
+async fn judge_test(file: Option<&str>) -> anyhow::Result<()> {
+    use compare::cases::{self, Expect, Grade};
+
+    let json = match file {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => cases::BUILTIN.to_string(),
+    };
+    let all = cases::load(&json)?;
+    let ai = ai_from_env().map_err(|e| anyhow::anyhow!("{e} (set APT_AI_PROVIDER, APT_AI_KEY and APT_AI_MODEL)"))?;
+    println!("Asking {} about {} pairs with known answers.\n", ai.model, all.len());
+    let http = reqwest::Client::builder().user_agent("AmePriceTrack").build()?;
+    let advisor = compare::advisor::Advisor::new(&http, ai);
+
+    let (mut right, mut wrong_same, mut missed, mut unsure) = (0, 0, 0, 0);
+    for case in &all {
+        let answer = cases::by_ai(&advisor, case).await;
+        let grade = cases::grade(case, &answer);
+        let mark = match grade {
+            Grade::Right => {
+                right += 1;
+                "ok      "
+            }
+            Grade::WrongSame => {
+                wrong_same += 1;
+                "WRONG   "
+            }
+            Grade::Missed => {
+                missed += 1;
+                "missed  "
+            }
+            Grade::Unsure => {
+                unsure += 1;
+                "not sure"
+            }
+        };
+        let expected = match (case.expect, case.pack) {
+            (Expect::Same, _) => "same".to_string(),
+            (Expect::Different, _) => "different".to_string(),
+            (Expect::Pack, Some((tracked, listing))) => format!("same item, {tracked} against {listing}"),
+            (Expect::Pack, None) => "same item, another amount".to_string(),
+        };
+        println!(
+            "{mark}  {}\n          expected: {expected}; answered: {}; the rules alone: {}",
+            case.name,
+            answer.describe(),
+            cases::by_rules(case).describe()
+        );
+    }
+    println!(
+        "\n{right} of {} right. {wrong_same} wrongly called the same (these would cause false alerts), \
+         {missed} matches missed, {unsure} left undecided.",
+        all.len()
+    );
+    if wrong_same > 0 {
+        anyhow::bail!("{wrong_same} pairs were wrongly called the same");
     }
     Ok(())
 }

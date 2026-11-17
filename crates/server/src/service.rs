@@ -265,9 +265,17 @@ pub async fn assistant_context(app: &App, user_id: i64) -> Result<String, Proble
             if let Some(brand) = &p.brand {
                 line.push_str(&format!(" | brand: {brand}"));
             }
+            if let Some(shipping) = v.price.shipping_cents.filter(|s| *s > 0) {
+                line.push_str(&format!(" | delivery adds {}", dollars(shipping)));
+            } else if v.price.shipping_extra {
+                line.push_str(" | delivery is charged on top");
+            }
+            if p.third_party == Some(true) {
+                line.push_str(&format!(" | sold by marketplace seller {}", p.seller.as_deref().unwrap_or("(unnamed)")));
+            }
             if let Some(other) = &v.elsewhere {
                 line.push_str(&format!(
-                    " | cheapest other store with the same product: {} at {}",
+                    " | cheapest other store with the same product (delivery included, same amount): {} at {}",
                     dollars(other.cents),
                     other.store_name
                 ));

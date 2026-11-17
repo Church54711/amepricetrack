@@ -8,6 +8,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /** A problem worth showing to the person, in words they can act on. */
@@ -131,6 +132,20 @@ class ApiClient(
             recordedAs = result.optString("recorded_as"),
         )
     }
+
+    /** Starts a find: the server tidies the words and says which stores to ask. */
+    suspend fun findStart(words: String): FindStart = parseFindStart(call("GET", "find?q=${encode(words)}"))
+
+    /** One store's first results for a name or barcode. */
+    suspend fun findAt(words: String, storeId: String): FindAnswer =
+        parseFindAnswer(call("GET", "find?q=${encode(words)}&store=${encode(storeId)}"))
+
+    /** Has the server read both sides of a comparison again now. */
+    suspend fun refreshComparison(comparisonId: Long) {
+        call("POST", "comparisons/$comparisonId/refresh")
+    }
+
+    private fun encode(text: String): String = URLEncoder.encode(text, "UTF-8")
 
     suspend fun chat(message: String): String = call("POST", "chat", JSONObject().put("message", message)).optString("reply")
 }

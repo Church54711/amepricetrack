@@ -30,6 +30,10 @@ pub fn routes() -> Router<App> {
         .route("/products/{id}/compare", post(compare_now))
         .route("/comparisons/{id}/same", post(comparison_same))
         .route("/comparisons/{id}/different", post(comparison_different))
+        .route("/comparisons/{id}/match", get(price_match_page))
+        .route("/comparisons/{id}/refresh", post(price_match_refresh))
+        .route("/find", get(find_page))
+        .route("/find/store", get(find_store))
         .route("/settings/compare", post(save_compare_settings))
         .route("/stores", get(stores_page))
         .route("/stores/add", post(add_store))
@@ -342,7 +346,7 @@ async fn watchlist(State(app): State<App>, CurrentUser(user): CurrentUser, Query
         div.page-head {
             div {
                 h1 { "Watchlist" }
-                p.muted { "Paste a product link to start tracking its price." }
+                p.muted { "Paste a product link, or type a product's name or barcode, to start tracking its price." }
             }
         }
         @if let Some(notice) = browser_notice(&app, &views) { (notice) }
@@ -350,8 +354,8 @@ async fn watchlist(State(app): State<App>, CurrentUser(user): CurrentUser, Query
             form method="post" action="/watches" data-once {
                 div.row {
                     div.grow {
-                        label for="url" { "Product link" }
-                        input #url type="text" name="url" required inputmode="url" autocomplete="off"
+                        label for="url" { "Product link, name or barcode" }
+                        input #url type="text" name="url" required autocomplete="off" autocapitalize="none"
                             placeholder="https://www.staples.com/\u{2026}/product_123456";
                     }
                     div.fixed {
@@ -361,8 +365,8 @@ async fn watchlist(State(app): State<App>, CurrentUser(user): CurrentUser, Query
                     button type="submit" data-busy="Adding\u{2026}" { "Track" }
                 }
                 div.hint {
-                    "Works with Staples, Best Buy, Walmart, Target, Amazon, Kohl's and Harbor Freight, "
-                    "and most other shops that publish standard product data."
+                    "A link works for Staples, Best Buy, Walmart, Target, Amazon, Kohl's, Harbor Freight and Hot Topic, "
+                    "and most other shops that publish standard product data. A name or a barcode number is looked up at each store for you to pick from."
                 }
             }
         }
@@ -398,6 +402,10 @@ async fn add_watch(State(app): State<App>, CurrentUser(user): CurrentUser, Form(
         Ok(t) => t,
         Err(p) => return back("/", p),
     };
+    // A name or a barcode rather than a link: look it up at the stores.
+    if !form.url.trim().is_empty() && !crate::find::is_link(&form.url) {
+        return Ok(Redirect::to(&format!("/find?q={}", encode(form.url.trim()))).into_response());
+    }
     match service::add_by_url(&app, user.id, &form.url, target).await {
         Ok(id) => Ok(go(&format!("/products/{id}"), true, "Tracking started. The first price check runs in the background.")),
         Err(p) => back("/", p),
@@ -407,15 +415,17 @@ async fn add_watch(State(app): State<App>, CurrentUser(user): CurrentUser, Form(
 // ------------------------------------------------------------ product page
 
 /// The "Other stores" card: where else this product was found, and for how much.
-fn other_stores_card(v: &WatchView, rows: &[crate::compare::tracking::StoreRow]) -> Markup {
+fn other_stores_card(v: &WatchView, rows: &[crate::compare::tracking::StoreRow], ignore_marketplace: bool) -> Markup {
     let id = v.product.id;
     let store = ui::store_name(&v.product.retailer);
     let searching = rows.iter().any(|r| r.comparison.status == "pending");
-    let mine = v.price.your_cents;
+    // Both sides with delivery included, and for the same amount of the item.
+    let mine = v.price.total_cents();
     let best = rows
         .iter()
         .filter(|r| r.comparison.status == "found" && r.product.as_ref().is_some_and(|p| p.in_stock != Some(false)))
-        .filter_map(|r| r.your_cents.map(|cents| (cents, r)))
+        .filter(|r| !(ignore_marketplace && r.marketplace))
+        .filter_map(|r| r.equivalent_cents.map(|cents| (cents, r)))
         .min_by_key(|(cents, _)| *cents);
     html! {
         div.card #stores data-refresh[searching] {
@@ -431,7 +441,12 @@ fn other_stores_card(v: &WatchView, rows: &[crate::compare::tracking::StoreRow])
             } @else {
                 @if let (Some((cents, row)), Some(mine)) = (best, mine) {
                     @if cents < mine {
-                        p { strong { (dollars(mine - cents)) " cheaper at " (row.store_name) "." } " " (dollars(cents)) " there, " (dollars(mine)) " at " (store) "." }
+                        p {
+                            strong { (dollars(mine - cents)) " cheaper at " (row.store_name) "." } " "
+                            (dollars(cents)) " there"
+                            @if let Some(amount) = &row.your_amount { " for " (amount) }
+                            ", " (dollars(mine)) " at " (store) "."
+                        }
                     } @else {
                         p { (store) " has the best price among the stores where this product was found." }
                     }
@@ -459,8 +474,16 @@ fn other_stores_card(v: &WatchView, rows: &[crate::compare::tracking::StoreRow])
                                                 @else if row.comparison.confirmed { span.tag { "Confirmed by you" } }
                                                 @if let Some(reason) = &row.comparison.reason { span { (reason) } }
                                                 @if p.in_stock == Some(false) { span.tag.bad { "Out of stock" } }
+                                                @if let Some(amount) = &row.their_amount { span.tag.warn { "Sold as " (amount) } }
+                                                @if row.marketplace {
+                                                    span.tag.warn { "Marketplace seller" @if let Some(seller) = &p.seller { ": " (seller) } }
+                                                }
                                             }
                                             div.inline-forms {
+                                                @if row.comparison.status == "found" && row.their_amount.is_none()
+                                                    && matches!((row.equivalent_cents, mine), (Some(theirs), Some(mine)) if theirs < mine) {
+                                                    a href={ "/comparisons/" (row.comparison.id) "/match" } { "Price match card" }
+                                                }
                                                 @if row.comparison.status == "possible" || row.comparison.ai_judged() {
                                                     form method="post" action={ "/comparisons/" (row.comparison.id) "/same" } {
                                                         button.link type="submit" { "Yes, same product" }
@@ -472,14 +495,24 @@ fn other_stores_card(v: &WatchView, rows: &[crate::compare::tracking::StoreRow])
                                             }
                                         }
                                         td.num {
-                                            @match row.your_cents {
-                                                Some(cents) => {
-                                                    strong { (dollars(cents)) }
+                                            @match (row.equivalent_cents, row.your_cents) {
+                                                (Some(comparable), Some(cents)) => {
+                                                    strong { (dollars(comparable)) }
+                                                    // What the figure is made of, when it is not simply the listed price.
+                                                    @if let (Some(theirs), Some(yours)) = (&row.their_amount, &row.your_amount) {
+                                                        div.price-note { "for " (yours) }
+                                                        div.price-note { (dollars(cents)) " for " (theirs) }
+                                                    }
+                                                    @if let Some(shipping) = row.shipping_cents.filter(|s| *s > 0) {
+                                                        div.price-note { "incl. " (dollars(shipping)) " delivery" }
+                                                    } @else if row.shipping_extra {
+                                                        div.price-note { "plus delivery" }
+                                                    }
                                                     @if p.current_price_cents.is_some_and(|listed| listed > cents) {
                                                         div.was { (dollars(p.current_price_cents.unwrap_or(cents))) }
                                                     }
                                                 }
-                                                None => { span.muted { "no price" } }
+                                                _ => { span.muted { "no price" } }
                                             }
                                         }
                                     }
@@ -524,6 +557,7 @@ async fn product_page(
     let now = db::now();
     let history = db::history(&app.db, id, user.id).await?;
     let stores = crate::compare::tracking::for_product(&app.db, user.id, id).await?;
+    let ignore_marketplace = db::settings(&app.db, user.id).await?.ignore_marketplace;
     let personal = v.price.is_personal();
     let store = ui::store_name(&p.retailer);
     let last_source = history.iter().rev().find(|h| !h.member).map(|h| h.source.as_str());
@@ -553,6 +587,16 @@ async fn product_page(
                                     @if let Some(public) = v.price.public_cents { ". Listed at " (dollars(public)) "." }
                                 }
                             }
+                            @if let Some(shipping) = v.price.shipping_cents.filter(|s| *s > 0) {
+                                p.muted { "Plus " (dollars(shipping)) " delivery." }
+                            } @else if v.price.shipping_extra {
+                                p.muted { "Delivery is charged on top; the store does not say how much." }
+                            } @else if let Some(name) = &v.price.shipping_membership {
+                                p.muted { "Free delivery with " (name) "." }
+                            }
+                            @if p.third_party == Some(true) {
+                                p.muted { "Sold by " (p.seller.as_deref().unwrap_or("another seller")) ", a marketplace seller, not by " (store) " itself." }
+                            }
                         }
                         None => {
                             @if pending { p.muted { "Checking the price now. Reload this page in a moment." } }
@@ -579,7 +623,7 @@ async fn product_page(
                     h2 { "Price history" }
                     (ui::chart(&history, v.watch.target_price_cents, now))
                 }
-                (other_stores_card(&v, &stores))
+                (other_stores_card(&v, &stores, ignore_marketplace))
                 @if !history.is_empty() {
                     div.card {
                         h2 { "Recorded changes" }
@@ -641,7 +685,15 @@ async fn product_page(
                             dt { "Lowest recorded" } dd { (dollars(low)) " on " (ui::when(at, true)) }
                         }
                         @if let Some(stock) = p.in_stock { dt { "Stock" } dd { @if stock { "In stock" } @else { "Out of stock" } } }
+                        @if let Some(seller) = &p.seller { dt { "Sold by" } dd { (seller) } }
+                        @match (v.price.shipping_cents, v.price.shipping_extra) {
+                            (Some(0), _) => { dt { "Delivery" } dd { "Free" } }
+                            (Some(shipping), _) => { dt { "Delivery" } dd { (dollars(shipping)) } }
+                            (None, true) => { dt { "Delivery" } dd { "Charged on top" } }
+                            (None, false) => {}
+                        }
                         @if let Some(model) = &p.model { dt { "Model" } dd { (model) } }
+                        @if let Some(gtin) = &p.gtin { dt { "Barcode" } dd { (gtin) } }
                         dt { "Item number" } dd { (p.retailer_sku) }
                         dt { "Tracking since" } dd { (ui::when(v.watch.created_at, true)) }
                         dt { "Last checked" }
@@ -736,9 +788,261 @@ async fn comparison_different(State(app): State<App>, CurrentUser(user): Current
     comparison_decision(&app, &user, id, false).await
 }
 
+/// The row of one comparison, with the tracked product it belongs to.
+async fn comparison_row(
+    app: &App,
+    user: &User,
+    comparison_id: i64,
+) -> Result<Option<(WatchView, crate::compare::tracking::StoreRow)>, WebError> {
+    let source: Option<i64> = sqlx::query_scalar("SELECT source_product_id FROM comparisons WHERE id = ? AND user_id = ?")
+        .bind(comparison_id)
+        .bind(user.id)
+        .fetch_optional(&app.db)
+        .await?;
+    let Some(source) = source else { return Ok(None) };
+    let Some(view) = service::watch_view(app, user.id, source).await? else { return Ok(None) };
+    let rows = crate::compare::tracking::for_product(&app.db, user.id, source).await?;
+    Ok(rows.into_iter().find(|r| r.comparison.id == comparison_id).map(|row| (view, row)))
+}
+
+/// A page to show at the register when asking a store to match another store's price.
+async fn price_match_page(
+    State(app): State<App>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<i64>,
+    Query(q): Query<PageQuery>,
+) -> WebResult {
+    let Some((v, row)) = comparison_row(&app, &user, id).await? else {
+        return Ok(not_found().await);
+    };
+    let Some(other) = row.product.as_ref().filter(|_| row.comparison.status == "found") else {
+        return Ok(not_found().await);
+    };
+    let chrome = chrome(&app, &user, &q).await?;
+    let now = db::now();
+    let mine = &v.product;
+    let (my_store, their_store) = (ui::store_name(&mine.retailer), row.store_name.clone());
+    let stale = other.last_success_at.is_none_or(|t| now - t > 6 * 3600);
+    let saving = match (mine.current_price_cents, other.current_price_cents) {
+        (Some(here), Some(there)) if there < here => Some(here - there),
+        _ => None,
+    };
+    let facts = |p: &db::Product| {
+        html! {
+            dl.facts {
+                @if let Some(model) = &p.model { dt { "Model" } dd { (model) } }
+                @if let Some(gtin) = &p.gtin { dt { "Barcode" } dd { (gtin) } }
+                dt { "Item number" } dd { (p.retailer_sku) }
+            }
+        }
+    };
+    let body = html! {
+        p.small { a href={ "/products/" (mine.id) "#stores" } { "\u{2190} " (mine.display_title()) } }
+        div.card {
+            h1 { "Price match" }
+            p.muted { "Show this at " (my_store) " when asking them to match the price at " (their_store) "." }
+            div.match-grid {
+                div.match-side {
+                    div.match-label { (my_store) }
+                    div.match-title { (mine.display_title()) }
+                    @match mine.current_price_cents {
+                        Some(cents) => { div.big-price { (dollars(cents)) } }
+                        None => { div.muted { "No price read yet" } }
+                    }
+                    (facts(mine))
+                }
+                div.match-side.better {
+                    div.match-label { (their_store) }
+                    div.match-title { (other.display_title()) }
+                    @match other.current_price_cents {
+                        Some(cents) => { div.big-price.personal { (dollars(cents)) } }
+                        None => { div.muted { "No price read yet" } }
+                    }
+                    (facts(other))
+                    p.small.muted {
+                        "Read "
+                        @match other.last_success_at { Some(t) => { (ui::ago(now, t)) } None => { "never" } }
+                    }
+                    a.btn href=(other.url) target="_blank" rel="noopener noreferrer" { "Open the listing at " (their_store) " \u{2197}" }
+                }
+            }
+            @if let Some(saving) = saving {
+                p { strong { (dollars(saving)) " lower at " (their_store) "." } }
+            } @else {
+                div.notice { "The listed price at " (their_store) " is not lower than at " (my_store) " right now." }
+            }
+            ul.checks {
+                @if row.marketplace {
+                    li.warn {
+                        "Sold by " (other.seller.as_deref().unwrap_or("another seller")) ", a marketplace seller. "
+                        "Stores usually match only what the other store sells itself."
+                    }
+                } @else if let Some(seller) = &other.seller {
+                    li { "Sold by " (seller) "." }
+                }
+                @if other.in_stock == Some(false) { li.warn { "Out of stock at " (their_store) ". Stores usually match only items that can be bought now." } }
+                @else if other.in_stock == Some(true) { li { "In stock at " (their_store) "." } }
+                @if let Some(shipping) = row.shipping_cents.filter(|s| *s > 0) {
+                    li.warn { "Delivery adds " (dollars(shipping)) " at " (their_store) ". Stores usually match the item's price, not delivery." }
+                } @else if row.shipping_extra {
+                    li.warn { "Delivery is charged on top at " (their_store) "." }
+                }
+                @if row.comparison.ai_judged() {
+                    li.warn { "Your AI judged these to be the same product. Check that the model or barcode matches." }
+                } @else if row.comparison.confirmed {
+                    li { "You confirmed these are the same product." }
+                } @else if let Some(reason) = &row.comparison.reason {
+                    li { "Matched by: " (reason) "." }
+                }
+                @if stale { li.warn { "This price was read a while ago. Check it again before you ask." } }
+            }
+            div.actions {
+                form method="post" action={ "/comparisons/" (id) "/refresh" } {
+                    button.secondary type="submit" { "Check both prices again" }
+                }
+            }
+            p.hint {
+                "Price-match rules differ from store to store and change over time. Most ask for the identical item, in stock, "
+                "sold and shipped by the other store itself. Check the current policy at " (my_store) " before relying on this."
+            }
+        }
+    };
+    Ok(html_page(ui::page(&chrome, "watchlist", "Price match", body)))
+}
+
+async fn price_match_refresh(State(app): State<App>, CurrentUser(user): CurrentUser, Path(id): Path<i64>) -> WebResult {
+    let Some((v, row)) = comparison_row(&app, &user, id).await? else {
+        return Ok(not_found().await);
+    };
+    db::check_soon(&app.db, v.product.id).await?;
+    if let Some(other) = &row.product {
+        db::check_soon(&app.db, other.id).await?;
+    }
+    app.wake.notify_one();
+    Ok(go(&format!("/comparisons/{id}/match"), true, "Checking both prices now. Reload in a few seconds to see the result."))
+}
+
+// -------------------------------------------------------------------- find
+
+#[derive(Deserialize)]
+struct FindQuery {
+    #[serde(default)]
+    q: String,
+    /// When given, this one store is searched while the page is built (the
+    /// page's script otherwise asks for each store's results itself).
+    store: Option<String>,
+    msg: Option<String>,
+    err: Option<String>,
+}
+
+fn find_results(answer: &crate::find::StoreAnswer) -> Markup {
+    html! {
+        @if let Some(problem) = &answer.problem {
+            p.muted { "Could not search this store: " (problem) }
+        } @else if answer.results.is_empty() {
+            p.muted { "Nothing found." }
+        } @else {
+            @for item in &answer.results {
+                div.find-item {
+                    a href=(item.url) target="_blank" rel="noopener noreferrer" { (item.title) }
+                    form method="post" action="/watches" data-once {
+                        input type="hidden" name="url" value=(item.url);
+                        button.secondary type="submit" data-busy="Adding\u{2026}" { "Track" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Looks a product up by name or barcode at every store, to pick one to track.
+async fn find_page(State(app): State<App>, CurrentUser(user): CurrentUser, Query(q): Query<FindQuery>) -> WebResult {
+    let flash = PageQuery { msg: q.msg.clone(), err: q.err.clone(), store: None }.flash();
+    let query = match crate::find::query(&q.q) {
+        Ok(query) => query,
+        Err(problem) => return back("/", problem),
+    };
+    let chrome = chrome_with(&app, &user, flash).await?;
+    let stores = crate::find::stores(&app).await?;
+    let tracked = crate::find::already_tracked(&app, user.id, &query).await?;
+    let ready = match q.store.as_deref() {
+        Some(store) if stores.iter().any(|s| s.retailer == store) => Some(crate::find::at_store(&app, &query, store).await?),
+        _ => None,
+    };
+    let body = html! {
+        p.small { a href="/" { "\u{2190} Watchlist" } }
+        div.page-head {
+            div {
+                h1 { "Find a product" }
+                p.muted {
+                    @if query.barcode { "Stores searched for the barcode " } @else { "Stores searched for " }
+                    strong { (query.text) }
+                    ". Pick the right one to start tracking it; it is then looked up at the other stores for you."
+                }
+            }
+        }
+        div.card {
+            form method="get" action="/find" {
+                div.row {
+                    div.grow {
+                        label for="q" { "Product name or barcode" }
+                        input #q type="text" name="q" required value=(query.text) autocomplete="off";
+                    }
+                    button type="submit" { "Search" }
+                }
+            }
+        }
+        @if !tracked.is_empty() {
+            div.card {
+                h2 { "Already on your list" }
+                @for p in &tracked {
+                    p { a href={ "/products/" (p.id) } { (p.display_title()) } " \u{b7} " (ui::store_name(&p.retailer)) }
+                }
+            }
+        }
+        div.card #find data-query=(query.text) {
+            @for store in &stores {
+                section.find-store data-store=(store.retailer) {
+                    h2 { (store.name) }
+                    div.find-results {
+                        @match ready.as_ref().filter(|a| a.store == store.retailer) {
+                            Some(answer) => { (find_results(answer)) }
+                            None => {
+                                // Without the page's script, each store is searched by following its link.
+                                p.muted.find-waiting hidden { "Searching\u{2026}" }
+                                noscript {
+                                    a href={ "/find?q=" (encode(&query.text)) "&store=" (encode(&store.retailer)) } { "Search " (store.name) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    Ok(html_page(ui::page(&chrome, "watchlist", "Find a product", body)))
+}
+
+/// One store's results, for the find page's script.
+async fn find_store(State(app): State<App>, CurrentUser(_user): CurrentUser, Query(q): Query<FindQuery>) -> Response {
+    let answer = match crate::find::query(&q.q) {
+        Ok(query) => crate::find::at_store(&app, &query, q.store.as_deref().unwrap_or("")).await,
+        Err(problem) => Err(problem),
+    };
+    match answer {
+        Ok(answer) => Json(serde_json::json!(answer)).into_response(),
+        Err(Problem::User(message)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response(),
+        Err(Problem::Internal(e)) => {
+            tracing::error!("find failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "The server hit a problem." }))).into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct CompareSettingsForm {
     auto_compare: Option<String>,
+    ignore_marketplace: Option<String>,
 }
 
 async fn save_compare_settings(
@@ -746,8 +1050,9 @@ async fn save_compare_settings(
     CurrentUser(user): CurrentUser,
     Form(form): Form<CompareSettingsForm>,
 ) -> WebResult {
-    sqlx::query("UPDATE user_settings SET auto_compare = ? WHERE user_id = ?")
+    sqlx::query("UPDATE user_settings SET auto_compare = ?, ignore_marketplace = ? WHERE user_id = ?")
         .bind(checked(&form.auto_compare))
+        .bind(checked(&form.ignore_marketplace))
         .bind(user.id)
         .execute(&app.db)
         .await?;
@@ -844,6 +1149,29 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
     let added = db::custom_stores(&app.db).await?;
     let location = crate::stores::location(&app.db).await?;
     let has_browser = app.fetcher.has_browser();
+    let health = crate::health::overview(&app.db).await?;
+    let now = db::now();
+    // How a store's price checks are going, for the table below.
+    let status = |retailer: &str| -> Markup {
+        let Some(store) = health.iter().find(|h| h.retailer == retailer) else {
+            return html! { span.muted { "Nothing tracked here" } };
+        };
+        html! {
+            @if store.unreadable(now) {
+                span.tag.bad { "Not readable" }
+                div.hint {
+                    "Nothing read since " (ui::when(store.down_since().unwrap_or(now), true))
+                    @if let Some(error) = &store.last_error { ": " (error) }
+                }
+            } @else if store.down_since().is_some() {
+                span.tag.warn { "Last checks failed" }
+                @if let Some(error) = &store.last_error { div.hint { (error) } }
+            } @else {
+                span.tag.good { "Working" }
+                @if let Some(t) = store.last_success_at { div.hint { "Last read " (ui::ago(now, t)) } }
+            }
+        }
+    };
 
     let body = html! {
         div.page-head {
@@ -909,13 +1237,14 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
         div.card {
             h2 { "Supported stores" }
             div.table-wrap { table {
-                thead { tr { th { "Store" } th { "Website" } th { "How its prices are read" } th {} } }
+                thead { tr { th { "Store" } th { "Website" } th { "How its prices are read" } th { "Status" } th {} } }
                 tbody {
                     @for r in retailers::RETAILERS {
                         tr {
                             td { (r.name) }
                             td.muted { (r.domain) }
                             td { (reading_text(r.mode, has_browser)) }
+                            td { (status(r.id)) }
                             td {}
                         }
                     }
@@ -924,6 +1253,7 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
                             td { (s.name) }
                             td.muted { (s.retailer) }
                             td { "Standard product data; searched at " span.muted { (s.search_url) } }
+                            td { (status(&s.retailer)) }
                             td {
                                 @if user.is_admin || s.added_by == Some(user.id) {
                                     form method="post" action={ "/stores/" (s.id) "/remove" }
@@ -936,6 +1266,7 @@ async fn stores_page(State(app): State<App>, CurrentUser(user): CurrentUser, Que
                     }
                 }
             } }
+            p.hint { "You get an alert when a store has not been readable for two days, and another when it works again." }
         }
 
         div.card #add {
@@ -1037,8 +1368,9 @@ async fn discounts_page(State(app): State<App>, CurrentUser(user): CurrentUser, 
             div {
                 h1 { "Discounts" }
                 p.muted {
-                    "Discounts you personally get at a store, such as an employee discount. "
-                    "They are applied to the listed price to show what you would pay, and your alerts and targets use that price."
+                    "What you personally get at a store: a discount such as an employee discount, or free delivery from a membership such as Prime or Walmart+. "
+                    "Discounts are applied to the listed price to show what you would pay, and your alerts and targets use that price. "
+                    "Free delivery is counted when stores are compared."
                 }
             }
         }
@@ -1065,7 +1397,8 @@ async fn discounts_page(State(app): State<App>, CurrentUser(user): CurrentUser, 
                             }
                             div.fixed {
                                 label for={ "pct" (r.id) } { "Percent off" }
-                                input id={ "pct" (r.id) } type="text" name="percent" required inputmode="decimal" value=(r.percent);
+                                input id={ "pct" (r.id) } type="text" name="percent" inputmode="decimal" placeholder="None"
+                                    value=[(r.percent > 0.0).then_some(r.percent)];
                             }
                         }
                         div.row {
@@ -1077,6 +1410,10 @@ async fn discounts_page(State(app): State<App>, CurrentUser(user): CurrentUser, 
                                 label for={ "ex" (r.id) } { "Except items mentioning" }
                                 input id={ "ex" (r.id) } type="text" name="exclude_keywords" value=(r.exclude_keywords) placeholder="Nothing excluded";
                             }
+                        }
+                        label.check {
+                            input type="checkbox" name="free_shipping" checked[r.free_shipping];
+                            span { "Free delivery on what " (ui::store_name(&r.retailer)) " ships itself" }
                         }
                         div.actions {
                             button type="submit" name="action" value="save" { "Save" }
@@ -1090,7 +1427,7 @@ async fn discounts_page(State(app): State<App>, CurrentUser(user): CurrentUser, 
             }
         }
         div.card {
-            h2 { "Add a discount" }
+            h2 { "Add a discount or membership" }
             form method="post" action="/discounts" {
                 div.row {
                     div.fixed {
@@ -1101,11 +1438,11 @@ async fn discounts_page(State(app): State<App>, CurrentUser(user): CurrentUser, 
                     }
                     div.grow {
                         label for="name" { "Name" }
-                        input #name type="text" name="name" required maxlength="60" placeholder="Employee discount";
+                        input #name type="text" name="name" required maxlength="60" placeholder="Employee discount, Prime\u{2026}";
                     }
                     div.fixed {
                         label for="percent" { "Percent off" }
-                        input #percent type="text" name="percent" required inputmode="decimal" placeholder="10";
+                        input #percent type="text" name="percent" inputmode="decimal" placeholder="10";
                     }
                 }
                 div.row {
@@ -1120,7 +1457,14 @@ async fn discounts_page(State(app): State<App>, CurrentUser(user): CurrentUser, 
                         div.hint { "Items whose name contains one of these words keep the listed price." }
                     }
                 }
-                button type="submit" { "Add discount" }
+                label.check {
+                    input type="checkbox" name="free_shipping";
+                    span {
+                        "Free delivery at this store"
+                        div.hint { "For a membership such as Prime or Walmart+. Leave the percent empty if that is all it gives you." }
+                    }
+                }
+                button type="submit" { "Add" }
             }
         }
     };
@@ -1139,14 +1483,20 @@ struct RuleForm {
     exclude_keywords: String,
     #[serde(default)]
     action: String,
+    free_shipping: Option<String>,
 }
 
 fn rule_fields(form: &RuleForm) -> Result<(String, f64), Problem> {
     let name = form.name.trim();
     if name.is_empty() {
-        return Err(service::user_problem("Give the discount a name."));
+        return Err(service::user_problem("Give it a name."));
     }
-    let percent = optional_percent(&form.percent)?.ok_or_else(|| service::user_problem("Enter the percent off."))?;
+    // A membership may give free delivery and nothing off the price.
+    let percent = match optional_percent(&form.percent)? {
+        Some(percent) => percent,
+        None if checked(&form.free_shipping) => 0.0,
+        None => return Err(service::user_problem("Enter the percent off, or tick free delivery.")),
+    };
     Ok((name.chars().take(60).collect(), percent))
 }
 
@@ -1159,9 +1509,10 @@ async fn add_rule(State(app): State<App>, CurrentUser(user): CurrentUser, Form(f
     if retailer.is_empty() {
         return back("/discounts", service::user_problem("Choose a store."));
     }
-    db::add_rule(&app.db, user.id, retailer, &name, percent, form.brands.trim(), form.exclude_keywords.trim()).await?;
+    let (brands, except) = (form.brands.trim(), form.exclude_keywords.trim());
+    db::add_terms(&app.db, user.id, retailer, &name, percent, brands, except, checked(&form.free_shipping)).await?;
     service::rebaseline(&app, user.id, retailer).await?;
-    Ok(go("/discounts", true, "Discount added. Your prices now include it."))
+    Ok(go("/discounts", true, "Added. Your prices now include it."))
 }
 
 async fn staples_preset(State(app): State<App>, CurrentUser(user): CurrentUser) -> WebResult {
@@ -1209,12 +1560,14 @@ async fn update_rule(
                 Err(p) => return back("/discounts", p),
             };
             sqlx::query(
-                "UPDATE discount_rules SET name = ?, percent = ?, brands = ?, exclude_keywords = ? WHERE id = ? AND user_id = ?",
+                "UPDATE discount_rules SET name = ?, percent = ?, brands = ?, exclude_keywords = ?, free_shipping = ?
+                 WHERE id = ? AND user_id = ?",
             )
             .bind(name)
             .bind(percent)
             .bind(form.brands.trim())
             .bind(form.exclude_keywords.trim())
+            .bind(checked(&form.free_shipping))
             .bind(id)
             .bind(user.id)
             .execute(&app.db)
@@ -1400,6 +1753,16 @@ async fn settings_view(app: &App, user: &User, flash: Option<Flash>, new_token: 
                         div.hint {
                             "Each new product is searched for at the other supported stores, and matches are kept up to date so you can see the best price. "
                             "Turn this off to compare only when you press \u{201c}Compare across stores\u{201d} on a product."
+                        }
+                    }
+                }
+                label.check {
+                    input type="checkbox" name="ignore_marketplace" checked[s.ignore_marketplace];
+                    span {
+                        "Leave marketplace sellers out"
+                        div.hint {
+                            "Amazon and Walmart also list offers from other sellers. With this on, those offers are still shown on a product's page "
+                            "but never count as the best price and never raise a \u{201c}cheaper elsewhere\u{201d} alert."
                         }
                     }
                 }

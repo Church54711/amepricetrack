@@ -50,6 +50,61 @@
     window.setTimeout(reloadWhenIdle, 8000);
   }
 
+  // ---- Find a product: ask for each store's results and show them as they arrive.
+  var find = document.getElementById("find");
+  if (find) {
+    var showResults = function (box, data) {
+      box.textContent = "";
+      var note = function (text) {
+        var p = document.createElement("p");
+        p.className = "muted";
+        p.textContent = text;
+        box.appendChild(p);
+      };
+      if (data.error) { note(data.error); return; }
+      if (data.problem) { note("Could not search this store: " + data.problem); return; }
+      if (!data.results.length) { note("Nothing found."); return; }
+      data.results.forEach(function (item) {
+        var row = document.createElement("div");
+        row.className = "find-item";
+        var link = document.createElement("a");
+        link.href = item.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = item.title;
+        var form = document.createElement("form");
+        form.method = "post";
+        form.action = "/watches";
+        var url = document.createElement("input");
+        url.type = "hidden";
+        url.name = "url";
+        url.value = item.url;
+        var button = document.createElement("button");
+        button.type = "submit";
+        button.className = "secondary";
+        button.textContent = "Track";
+        form.appendChild(url);
+        form.appendChild(button);
+        form.addEventListener("submit", function () { button.disabled = true; button.textContent = "Adding…"; });
+        row.appendChild(link);
+        row.appendChild(form);
+        box.appendChild(row);
+      });
+    };
+    find.querySelectorAll(".find-store").forEach(function (section) {
+      var waiting = section.querySelector(".find-waiting");
+      if (!waiting) return; // already searched while the page was built
+      waiting.hidden = false;
+      var box = section.querySelector(".find-results");
+      var address = "/find/store?q=" + encodeURIComponent(find.dataset.query) +
+        "&store=" + encodeURIComponent(section.dataset.store);
+      fetch(address)
+        .then(function (r) { return r.json(); })
+        .then(function (data) { showResults(box, data); })
+        .catch(function () { showResults(box, { error: "Could not reach this server. Reload to try again." }); });
+    });
+  }
+
   // ---- AI settings: fill in the address and model when the service changes.
   var provider = document.getElementById("ai_provider");
   if (provider) {

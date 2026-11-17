@@ -159,15 +159,12 @@ pub async fn push(http: &reqwest::Client, ntfy_url: &str, webhook_url: &str, tit
     if !ntfy_url.is_empty() {
         // ntfy headers must be plain ASCII; the arrow in price drops is not.
         let ascii_title: String = title.replace('\u{2192}', "->").chars().filter(char::is_ascii).collect();
-        let sent = http
-            .post(ntfy_url)
-            .header("Title", ascii_title)
-            .header("Click", link)
-            .header("Tags", "moneybag")
-            .body(body.to_string())
-            .send()
-            .await
-            .and_then(|r| r.error_for_status());
+        let mut request = http.post(ntfy_url).header("Title", ascii_title).header("Tags", "moneybag");
+        // An alert about the server itself may have nowhere to link to.
+        if !link.is_empty() {
+            request = request.header("Click", link);
+        }
+        let sent = request.body(body.to_string()).send().await.and_then(|r| r.error_for_status());
         if let Err(e) = sent {
             problems.push(format!("ntfy: {}", crate::fetch::root_cause(&e)));
         }
@@ -220,6 +217,11 @@ mod tests {
             fail_count: 0,
             last_error: None,
             details: None,
+            seller: None,
+            third_party: None,
+            store_ships: None,
+            ships_free: None,
+            shipping_cents: None,
         }
     }
 
@@ -295,6 +297,7 @@ mod tests {
             exclude_keywords: String::new(),
             enabled: true,
             created_at: 0,
+            free_shipping: false,
         };
         assert_eq!(decide(&w, &p, &pricing::view(&p, None, &[])), None);
         let alert = decide(&w, &p, &pricing::view(&p, None, &[rule])).unwrap();

@@ -257,6 +257,16 @@ pub struct Observation {
     /// The local store this price is for, at chains that price per store
     /// and say which store they used.
     pub local_store: Option<LocalStore>,
+    /// Who sells the item, at stores that host other sellers.
+    pub seller: Option<String>,
+    /// True when that seller is not the store itself.
+    pub third_party: Option<bool>,
+    /// True when the store itself ships the item, whoever sells it.
+    pub store_ships: Option<bool>,
+    /// True when the page says delivery is free, false when it is charged.
+    pub ships_free: Option<bool>,
+    /// The delivery charge, when the page states one.
+    pub shipping_cents: Option<i64>,
 }
 
 /// The local store a chain used for a price.

@@ -1,0 +1,191 @@
+[
+  {
+    "name": "AirPods Pro 2, worded two ways",
+    "expect": "same",
+    "store": "Walmart",
+    "tracked": { "title": "Apple AirPods Pro 2 Wireless Earbuds with MagSafe Charging Case (USB-C)", "brand": "Apple", "price": 199.99 },
+    "listing": { "title": "Apple AirPods Pro (2nd Generation) Wireless Ear Buds with USB-C Charging", "brand": "Apple", "price": 189.00 }
+  },
+  {
+    "name": "One ream of the same copy paper",
+    "expect": "same",
+    "store": "Amazon",
+    "tracked": { "title": "Hammermill Copy Plus 8.5\" x 11\" Copy Paper, 20 lbs., 92 Brightness, 500 Sheets/Ream (105007)", "brand": "Hammermill", "price": 9.49 },
+    "listing": { "title": "Hammermill Printer Paper, 20 lb Copy Paper, 8.5 x 11 - 1 Ream (500 Sheets) - 92 Bright, Made in the USA", "brand": "Hammermill", "price": 8.97, "details": "Copy Plus. 20 lb. 92 brightness. Letter size. 500 sheets" }
+  },
+  {
+    "name": "Headphones, same model and colour",
+    "expect": "same",
+    "store": "Amazon",
+    "tracked": { "title": "Sony - WH-1000XM5 Wireless Noise-Canceling Over-the-Ear Headphones - Black", "brand": "Sony", "model": "WH1000XM5/B", "price": 399.99 },
+    "listing": { "title": "Sony WH-1000XM5 The Best Wireless Noise Canceling Headphones, Auto NC Optimizer, 30-Hour Battery, Alexa Voice Control, Black", "brand": "Sony", "price": 348.00, "details": "Colour: Black" }
+  },
+  {
+    "name": "Collectible figure with the same item number",
+    "expect": "same",
+    "store": "Amazon",
+    "tracked": { "title": "Funko Disney Lilo & Stitch Pop! Stitch With Ukulele Vinyl Figure", "brand": "Funko", "price": 12.90, "details": "Pop! number 1044. Stitch holding a ukulele" },
+    "listing": { "title": "Funko POP Disney: Lilo and Stitch - Stitch with Ukulele #1044 Vinyl Figure", "brand": "Funko", "price": 11.99 }
+  },
+  {
+    "name": "Stand mixer, same model and colour",
+    "expect": "same",
+    "store": "Target",
+    "tracked": { "title": "KitchenAid Artisan Series 5 Quart Tilt-Head Stand Mixer - Empire Red", "brand": "KitchenAid", "model": "KSM150PSER", "price": 449.99 },
+    "listing": { "title": "KitchenAid Artisan 5qt Tilt-Head Stand Mixer KSM150PS Empire Red", "brand": "KitchenAid", "price": 449.99 }
+  },
+  {
+    "name": "Towel set, colour given in the details",
+    "expect": "same",
+    "store": "Kohl's",
+    "tracked": { "title": "Madison Park Signature 800GSM 100% Cotton 8 Piece Towel Set, Sage", "brand": "Madison Park Signature", "price": 64.99 },
+    "listing": { "title": "Madison Park Signature 800GSM Cotton 8-piece Bath Towel Set", "brand": "Madison Park Signature", "price": 71.99, "details": "Colour: Sage. Size: 8-Piece. Two bath sheets, two bath towels, two hand towels, two washcloths" }
+  },
+  {
+    "name": "Building set with the same set number",
+    "expect": "same",
+    "store": "Walmart",
+    "tracked": { "title": "LEGO Star Wars The Mandalorian's N-1 Starfighter 75325 Building Kit", "brand": "LEGO", "price": 59.99 },
+    "listing": { "title": "LEGO Star Wars The Mandalorian's N-1 Starfighter Building Toy Set 75325, 412 Pieces", "brand": "LEGO", "price": 47.99 }
+  },
+  {
+    "name": "A dozen markers, counted two ways",
+    "expect": "same",
+    "store": "Amazon",
+    "tracked": { "title": "Sharpie Permanent Markers, Fine Point, Black, 12 Count", "brand": "Sharpie", "price": 9.99 },
+    "listing": { "title": "SHARPIE Permanent Markers, Fine Point, Black, Box of 12 (30001)", "brand": "Sharpie", "price": 8.74 }
+  },
+
+  {
+    "name": "A different model of earbuds",
+    "expect": "different",
+    "store": "Walmart",
+    "tracked": { "title": "Apple AirPods Pro 2 Wireless Earbuds with MagSafe Charging Case (USB-C)", "brand": "Apple", "price": 199.99 },
+    "listing": { "title": "Apple AirPods 4 Wireless Earbuds with Active Noise Cancellation", "brand": "Apple", "price": 168.99 }
+  },
+  {
+    "name": "Collectible figure variant with extras",
+    "expect": "different",
+    "store": "Amazon",
+    "tracked": { "title": "Funko Disney Lilo & Stitch Pop! Angel Vinyl Figure", "brand": "Funko", "price": 13.90 },
+    "listing": { "title": "Funko Pop! Disney: Lilo & Stitch - Angel with Bags, Easter Collection", "brand": "Funko", "price": 12.99 }
+  },
+  {
+    "name": "Headphones in another colour",
+    "expect": "different",
+    "store": "Target",
+    "tracked": { "title": "Sony - WH-1000XM5 Wireless Noise-Canceling Over-the-Ear Headphones - Black", "brand": "Sony", "model": "WH1000XM5/B", "price": 399.99 },
+    "listing": { "title": "Sony WH-1000XM5 Bluetooth Wireless Noise-Canceling Headphones - Silver", "brand": "Sony", "price": 399.99 }
+  },
+  {
+    "name": "The previous generation of the headphones",
+    "expect": "different",
+    "store": "Walmart",
+    "tracked": { "title": "Sony - WH-1000XM5 Wireless Noise-Canceling Over-the-Ear Headphones - Black", "brand": "Sony", "model": "WH1000XM5/B", "price": 399.99 },
+    "listing": { "title": "Sony WH-1000XM4 Wireless Noise Canceling Over-Ear Headphones, Black", "brand": "Sony", "price": 248.00 }
+  },
+  {
+    "name": "An accessory for the product",
+    "expect": "different",
+    "store": "Amazon",
+    "tracked": { "title": "Apple iPhone 15 128GB - Black (Unlocked)", "brand": "Apple", "price": 729.00 },
+    "listing": { "title": "Spigen Ultra Hybrid Case Designed for iPhone 15 - Matte Black", "brand": "Spigen", "price": 16.99 }
+  },
+  {
+    "name": "A bigger bottle of the same shampoo",
+    "expect": "different",
+    "store": "Target",
+    "tracked": { "title": "Pantene Pro-V Daily Moisture Renewal Shampoo, 12 fl oz", "brand": "Pantene", "price": 5.99 },
+    "listing": { "title": "Pantene Pro-V Daily Moisture Renewal Shampoo - 27.7 fl oz", "brand": "Pantene", "price": 9.99 }
+  },
+  {
+    "name": "A bundle with a game and a case",
+    "expect": "different",
+    "store": "Walmart",
+    "tracked": { "title": "Nintendo Switch OLED Model - White", "brand": "Nintendo", "price": 349.99 },
+    "listing": { "title": "Nintendo Switch OLED Model White Bundle with Mario Kart 8 Deluxe and Carrying Case", "brand": "Nintendo", "price": 419.00 }
+  },
+  {
+    "name": "Twice the storage",
+    "expect": "different",
+    "store": "Best Buy",
+    "tracked": { "title": "Samsung T7 Portable SSD 1TB - Titan Gray", "brand": "Samsung", "price": 109.99 },
+    "listing": { "title": "Samsung - T7 2TB External USB 3.2 Gen 2 Portable SSD - Titan Gray", "brand": "Samsung", "price": 189.99 }
+  },
+  {
+    "name": "A heavier paper from the same maker",
+    "expect": "different",
+    "store": "Walmart",
+    "tracked": { "title": "Hammermill Copy Plus 8.5\" x 11\" Copy Paper, 20 lbs., 92 Brightness, 500 Sheets/Ream (105007)", "brand": "Hammermill", "price": 9.49 },
+    "listing": { "title": "Hammermill Premium Multi-Purpose Paper, 8.5 x 11, 24 lb, 97 Bright, 500 Sheets", "brand": "Hammermill", "price": 12.48 }
+  },
+  {
+    "name": "The high-yield ink cartridge",
+    "expect": "different",
+    "store": "Staples",
+    "tracked": { "title": "HP 67 Black Standard Yield Ink Cartridge", "brand": "HP", "price": 18.89 },
+    "listing": { "title": "HP 67XL Black High Yield Ink Cartridge", "brand": "HP", "price": 28.89 }
+  },
+  {
+    "name": "A refurbished one against a new one",
+    "expect": "different",
+    "store": "Amazon",
+    "tracked": { "title": "Apple iPad (10th Generation) 10.9-inch 64GB Wi-Fi - Blue", "brand": "Apple", "price": 349.00 },
+    "listing": { "title": "Apple iPad 10th Gen 10.9in 64GB WiFi Blue (Renewed)", "brand": "Apple", "price": 259.00 }
+  },
+  {
+    "name": "Another set from the same line",
+    "expect": "different",
+    "store": "Target",
+    "tracked": { "title": "LEGO Star Wars The Mandalorian's N-1 Starfighter 75325 Building Kit", "brand": "LEGO", "price": 59.99 },
+    "listing": { "title": "LEGO Star Wars Boba Fett's Starship 75312 Building Kit", "brand": "LEGO", "price": 49.99 }
+  },
+  {
+    "name": "Another battery line in another count",
+    "expect": "different",
+    "store": "Walmart",
+    "tracked": { "title": "Duracell Coppertop AA Alkaline Batteries, 8 Count", "brand": "Duracell", "price": 9.47 },
+    "listing": { "title": "Duracell Optimum AA Alkaline Batteries, 18 Count", "brand": "Duracell", "price": 24.97 }
+  },
+
+  {
+    "name": "Batteries, 8 against 24",
+    "expect": "pack",
+    "pack": [8, 24],
+    "store": "Walmart",
+    "tracked": { "title": "Duracell Coppertop AA Alkaline Batteries, 8 Count", "brand": "Duracell", "price": 9.47 },
+    "listing": { "title": "Duracell Coppertop AA Batteries, 24 Count Pack, Double A Battery with Long-lasting Power", "brand": "Duracell", "price": 19.97 }
+  },
+  {
+    "name": "Paper, a ream against a carton",
+    "expect": "pack",
+    "pack": [500, 5000],
+    "store": "Walmart",
+    "tracked": { "title": "Hammermill Copy Plus 8.5\" x 11\" Copy Paper, 20 lbs., 92 Brightness, 500 Sheets/Ream (105007)", "brand": "Hammermill", "price": 9.49 },
+    "listing": { "title": "Hammermill Copy Plus Paper, 8.5 x 11, 20 lb, 92 Bright, 5000 Sheets, 10 Reams (105007)", "brand": "Hammermill", "price": 54.98 }
+  },
+  {
+    "name": "Paper towels, 6 rolls against 12",
+    "expect": "pack",
+    "pack": [6, 12],
+    "store": "Target",
+    "tracked": { "title": "Bounty Select-A-Size Paper Towels, 6 Double Rolls, White", "brand": "Bounty", "price": 16.99 },
+    "listing": { "title": "Bounty Select-A-Size Paper Towels - 12 Double Rolls", "brand": "Bounty", "price": 31.99, "details": "Colour: White" }
+  },
+  {
+    "name": "Tape, one roll against a pack of three",
+    "expect": "pack",
+    "pack": [1, 3],
+    "store": "Amazon",
+    "tracked": { "title": "Scotch Magic Tape, 3/4\" x 1000\", 1 Roll (810)", "brand": "Scotch", "price": 3.99 },
+    "listing": { "title": "Scotch Magic Tape, Invisible, 3/4 in x 1000 in, 3 Rolls/Pack (810K3)", "brand": "Scotch", "price": 8.98 }
+  },
+  {
+    "name": "Markers, a dozen against three dozen",
+    "expect": "pack",
+    "pack": [12, 36],
+    "store": "Staples",
+    "tracked": { "title": "Sharpie Permanent Markers, Fine Point, Black, 12 Count", "brand": "Sharpie", "price": 9.99 },
+    "listing": { "title": "Sharpie Permanent Markers, Fine Tip, Black, 36/Pack (1884739)", "brand": "Sharpie", "price": 24.99 }
+  }
+]

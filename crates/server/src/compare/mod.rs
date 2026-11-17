@@ -7,6 +7,7 @@
 //! to open and settles the cases a barcode or model number does not.
 
 pub mod advisor;
+pub mod cases;
 pub mod matching;
 pub mod search;
 pub mod tracking;
@@ -15,7 +16,7 @@ use crate::db::Db;
 use crate::fetch::{FetchError, Fetcher};
 use crate::retailers::{FetchMode, Observation};
 use advisor::{Advisor, Judgement};
-use matching::{Facts, Verdict, POSSIBLE, SAME};
+use matching::{Facts, PackDiff, Verdict, POSSIBLE, SAME};
 use search::{Candidate, StoreSearch};
 use std::collections::HashSet;
 
@@ -37,6 +38,8 @@ pub struct Found {
     pub reason: String,
     /// The AI service made the call; the rules alone were not sure.
     pub by_ai: bool,
+    /// Set when this is the same item sold in a different amount.
+    pub pack: Option<PackDiff>,
 }
 
 pub enum StoreResult {
@@ -91,7 +94,8 @@ struct Opened {
 
 #[derive(Clone, PartialEq)]
 enum AiView {
-    Same(String),
+    /// The same product, with why and (for another pack size) the amounts.
+    Same(String, Option<PackDiff>),
     Different,
     Unsure,
 }
@@ -114,7 +118,7 @@ impl Hunt<'_> {
     }
 
     fn settled(&self) -> bool {
-        self.opened.iter().any(|o| o.verdict.score >= SAME || matches!(o.ai, Some(AiView::Same(_))))
+        self.opened.iter().any(|o| o.verdict.score >= SAME || matches!(o.ai, Some(AiView::Same(..))))
     }
 
     /// Links worth opening, likeliest first, by name alone. Stores pad thin
@@ -216,7 +220,7 @@ impl Hunt<'_> {
         tracing::debug!(store = self.store.retailer, listings = listings.len(), ?judgement, "AI judged");
         for (position, index) in waiting.iter().enumerate() {
             self.opened[*index].ai = Some(match &judgement {
-                Judgement::Same { index, why } if *index == position => AiView::Same(why.clone()),
+                Judgement::Same { index, why, pack } if *index == position => AiView::Same(why.clone(), pack.clone()),
                 Judgement::Unsure { .. } => AiView::Unsure,
                 _ => AiView::Different,
             });
@@ -224,9 +228,15 @@ impl Hunt<'_> {
     }
 
     fn finish(self, searched_ok: bool, last_error: Option<FetchError>) -> StoreResult {
-        let Hunt { opened, ai_ruled_out, .. } = self;
+        let Hunt { opened, ai_ruled_out, source, .. } = self;
         let found = |o: Opened, score: u8, reason: String, by_ai: bool| {
-            StoreResult::Found(Box::new(Found { candidate: o.candidate, obs: o.obs, mode: o.mode, score, reason, by_ai }))
+            // The names say how the amounts differ when they state them; otherwise the AI's count stands.
+            let stated = matching::pack_difference(&source.title, &o.facts.title);
+            let pack = match &o.ai {
+                Some(AiView::Same(_, counted)) if by_ai => stated.or_else(|| counted.clone()),
+                _ => stated,
+            };
+            StoreResult::Found(Box::new(Found { candidate: o.candidate, obs: o.obs, mode: o.mode, score, reason, by_ai, pack }))
         };
         // A barcode or model number settles it.
         if let Some(i) = (0..opened.len()).filter(|i| opened[*i].verdict.score >= SAME).max_by_key(|i| opened[*i].verdict.score) {
@@ -234,10 +244,10 @@ impl Hunt<'_> {
             let (score, reason) = (o.verdict.score, o.verdict.reason.to_string());
             return found(o, score, reason, false);
         }
-        if let Some(i) = opened.iter().position(|o| matches!(o.ai, Some(AiView::Same(_)))) {
+        if let Some(i) = opened.iter().position(|o| matches!(o.ai, Some(AiView::Same(..)))) {
             let o = opened.into_iter().nth(i).expect("index is in range");
             let why = match &o.ai {
-                Some(AiView::Same(why)) if !why.is_empty() => why.clone(),
+                Some(AiView::Same(why, _)) if !why.is_empty() => why.clone(),
                 _ => "Judged the same product".to_string(),
             };
             return found(o, SAME, why, true);
@@ -267,7 +277,7 @@ impl Hunt<'_> {
 }
 
 /// Loads a store's search results page and picks the product links out of it.
-async fn search_page(fetcher: &Fetcher, store: &StoreSearch, address: &str) -> Result<Vec<Candidate>, FetchError> {
+pub async fn search_page(fetcher: &Fetcher, store: &StoreSearch, address: &str) -> Result<Vec<Candidate>, FetchError> {
     let retailer = store.retailer.as_str();
     if let Some(mode) = store.mode {
         let html = fetcher.page(retailer, address, mode).await?;
@@ -360,7 +370,7 @@ mod tests {
     /// How a finished hunt with these opened pages is reported: status, title, by AI.
     async fn outcome(pages: Vec<Opened>, ai_ruled_out: bool) -> String {
         let app = crate::test_app().await;
-        let source = Facts::default();
+        let source = Facts { title: "Pens 12 Pack".into(), ..Default::default() };
         let store = search::builtin().remove(2);
         let hunt = Hunt {
             fetcher: &app.fetcher,
@@ -374,7 +384,8 @@ mod tests {
         match hunt.finish(true, None) {
             StoreResult::Found(f) => {
                 let kind = if f.score >= SAME { "same" } else { "possible" };
-                format!("{kind}: {} ({}{})", f.candidate.title, if f.by_ai { "AI: " } else { "" }, f.reason)
+                let pack = f.pack.map(|p| format!(" [{} for {}]", p.other_qty, p.source_qty)).unwrap_or_default();
+                format!("{kind}: {} ({}{}){pack}", f.candidate.title, if f.by_ai { "AI: " } else { "" }, f.reason)
             }
             StoreResult::NotFound(Some(note)) => format!("not found: {note}"),
             StoreResult::NotFound(None) => "not found".into(),
@@ -384,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_barcode_beats_the_ai_and_the_ai_beats_a_similar_name() {
-        let same = |why: &str| Some(AiView::Same(why.into()));
+        let same = |why: &str| Some(AiView::Same(why.into(), None));
         // A barcode match needs nobody's opinion.
         assert_eq!(
             outcome(vec![opened("A", 70, same("Looks alike")), opened("B", 100, None)], false).await,
@@ -414,5 +425,13 @@ mod tests {
         // Nothing opened because the AI saw nothing worth opening in the results.
         assert_eq!(outcome(vec![], true).await, "not found: Nothing in the search results is this product, according to your AI");
         assert_eq!(outcome(vec![], false).await, "not found");
+        // Another pack size: the names' own amounts are used, and failing that the AI's count.
+        assert_eq!(outcome(vec![opened("Pens 36 Pack", 95, None)], false).await, "same: Pens 36 Pack (Same barcode) [36 for 12]");
+        let counted =
+            Some(AiView::Same("Same pens".into(), Some(PackDiff { source_qty: 12.0, other_qty: 24.0, unit: "count".into() })));
+        assert_eq!(
+            outcome(vec![opened("Two dozen pens", 62, counted)], false).await,
+            "same: Two dozen pens (AI: Same pens) [24 for 12]"
+        );
     }
 }

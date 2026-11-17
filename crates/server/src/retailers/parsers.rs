@@ -44,7 +44,7 @@ pub fn parse(retailer: &str, body: &str) -> Result<Observation, ParseError> {
             obs.list_price_cents = None;
         }
     }
-    for field in [&mut obs.title, &mut obs.brand, &mut obs.model, &mut obs.gtin, &mut obs.image_url] {
+    for field in [&mut obs.title, &mut obs.brand, &mut obs.model, &mut obs.gtin, &mut obs.image_url, &mut obs.seller] {
         if let Some(v) = field {
             let cleaned = decode_entities(v.trim());
             *field = if cleaned.is_empty() { None } else { Some(cleaned) };
@@ -477,6 +477,30 @@ fn walmart(html: &str) -> Observation {
         return generic(html);
     };
     let status = product.get("availabilityStatus").and_then(|v| v.as_str());
+    // Walmart hosts other sellers. "INTERNAL" is Walmart itself; other
+    // sellers may still have Walmart ship for them.
+    let seller_type = product.get("sellerType").and_then(|v| v.as_str());
+    let third_party = seller_type.map(|kind| kind != "INTERNAL");
+    let store_ships = match (third_party, product.get("wfsEnabled").and_then(|v| v.as_bool())) {
+        (Some(false), _) | (_, Some(true)) => Some(true),
+        (Some(true), Some(false)) => Some(false),
+        _ => None,
+    };
+    // The delivery choice: free, a stated charge, or charged without the amount.
+    let shipping = product
+        .get("fulfillmentOptions")
+        .and_then(|v| v.as_array())
+        .and_then(|options| options.iter().find(|o| o.get("type").and_then(|t| t.as_str()) == Some("SHIPPING")));
+    let stated_charge = shipping
+        .and_then(|s| s.pointer("/speedDetails/fulfillmentPrice/price"))
+        .or(product.pointer("/fulfillmentSummary/0/fulfillmentPrice/price"))
+        .and_then(|v| v.as_f64())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .map(|f| (f * 100.0).round() as i64);
+    let ships_free = match stated_charge {
+        Some(cents) => Some(cents == 0),
+        None => shipping.and_then(|s| s.pointer("/speedDetails/freeFulfillment")).and_then(|v| v.as_bool()),
+    };
     Observation {
         title: product.get("name").and_then(text),
         brand: product.get("brand").and_then(text),
@@ -497,6 +521,11 @@ fn walmart(html: &str) -> Observation {
             let town = [city, state].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(", ");
             LocalStore { id, place: format!("{town} {zip}").trim().to_string() }
         }),
+        seller: product.get("sellerDisplayName").and_then(text).or_else(|| product.get("sellerName").and_then(text)),
+        third_party,
+        store_ships,
+        ships_free,
+        shipping_cents: stated_charge.filter(|cents| *cents > 0),
     }
 }
 
@@ -541,7 +570,7 @@ fn target_json(body: &str) -> Observation {
                 .unwrap_or_default();
             details_of(vec![], Some(&bullets.join("; ")))
         },
-        local_store: None,
+        ..Default::default()
     }
 }
 
@@ -623,6 +652,25 @@ fn amazon(html: &str) -> Observation {
     let brand = pick("#bylineInfo")
         .map(|t| t.trim_start_matches("Visit the ").trim_start_matches("Brand: ").trim_end_matches(" Store").to_string());
 
+    // Amazon hosts other sellers. The buying box names who sells the item
+    // and, when that is someone else, who ships it.
+    let is_amazon = |name: &str| name.to_ascii_lowercase().starts_with("amazon");
+    let seller = pick(r#"[offer-display-feature-name$="merchant-info"] .offer-display-feature-text-message"#);
+    let shipper = pick(r#"[offer-display-feature-name$="fulfiller-info"] .offer-display-feature-text-message"#);
+    let third_party = seller.as_deref().map(|name| !is_amazon(name));
+    let store_ships = shipper.as_deref().or(seller.as_deref()).map(is_amazon);
+    // "FREE", or the charge for delivering this one item.
+    let delivery = attr(
+        "#deliveryBlockMessage [data-csa-c-delivery-price], #mir-layout-DELIVERY_BLOCK [data-csa-c-delivery-price]",
+        "data-csa-c-delivery-price",
+    );
+    let shipping_cents = delivery.as_deref().and_then(money_str);
+    let ships_free = match (&delivery, shipping_cents) {
+        (_, Some(_)) => Some(false),
+        (Some(text), None) if text.eq_ignore_ascii_case("free") => Some(true),
+        _ => None,
+    };
+
     Observation {
         title: pick("#productTitle").or_else(|| pick("#title")),
         brand,
@@ -648,6 +696,11 @@ fn amazon(html: &str) -> Observation {
             details_of(vec![("Colour".into(), colour), ("Size".into(), size)], bullets.as_deref())
         },
         local_store: None,
+        seller,
+        third_party,
+        store_ships,
+        ships_free,
+        shipping_cents,
     }
 }
 
@@ -745,8 +798,101 @@ mod tests {
         let obs = parse("walmart", html).unwrap();
         assert_eq!(obs.price_cents, Some(347));
         assert_eq!(obs.local_store, Some(LocalStore { id: "1234".into(), place: "Springfield, IL 62704".into() }));
+        assert_eq!((obs.seller, obs.third_party, obs.ships_free), (None, None, None), "this page does not say");
         // A page that does not say is fine too.
         assert_eq!(parse("walmart", &fixture("walmart.html")).unwrap().local_store, None);
+    }
+
+    fn walmart_offer(extra: &str) -> Observation {
+        let html = format!(
+            r#"<html><body><script id="__NEXT_DATA__" type="application/json">
+            {{"props":{{"pageProps":{{"initialData":{{"data":{{"product":{{
+              "name":"Clear Phone Case","priceInfo":{{"currentPrice":{{"price":12.99}}}},"availabilityStatus":"IN_STOCK",{extra}
+            }}}}}}}}}}}}</script></body></html>"#
+        );
+        parse("walmart", &html).unwrap()
+    }
+
+    #[test]
+    fn walmart_page_says_who_sells_and_whether_delivery_is_free() {
+        // Sold and shipped by Walmart, free delivery.
+        let own = walmart_offer(
+            r#""sellerDisplayName":"Walmart.com","sellerType":"INTERNAL","wfsEnabled":false,
+               "fulfillmentOptions":[{"type":"SHIPPING","speedDetails":{"fulfillmentPrice":null,"freeFulfillment":true}}]"#,
+        );
+        assert_eq!(own.seller.as_deref(), Some("Walmart.com"));
+        assert_eq!(
+            (own.third_party, own.store_ships, own.ships_free, own.shipping_cents),
+            (Some(false), Some(true), Some(true), None)
+        );
+
+        // Another seller that Walmart ships for; delivery is charged, the amount not given.
+        let other = walmart_offer(
+            r#""sellerDisplayName":"Brand Bargain Depot","sellerType":"EXTERNAL","wfsEnabled":true,
+               "fulfillmentOptions":[{"type":"PICKUP"},{"type":"SHIPPING","speedDetails":{"fulfillmentPrice":null,"freeFulfillment":false}}]"#,
+        );
+        assert_eq!(other.seller.as_deref(), Some("Brand Bargain Depot"));
+        assert_eq!(
+            (other.third_party, other.store_ships, other.ships_free, other.shipping_cents),
+            (Some(true), Some(true), Some(false), None)
+        );
+
+        // Another seller that ships it itself and states the charge.
+        let charged = walmart_offer(
+            r#""sellerDisplayName":"Far Away Goods","sellerType":"EXTERNAL","wfsEnabled":false,
+               "fulfillmentOptions":[{"type":"SHIPPING","speedDetails":{"fulfillmentPrice":{"price":5.99},"freeFulfillment":false}}]"#,
+        );
+        assert_eq!(
+            (charged.third_party, charged.store_ships, charged.ships_free, charged.shipping_cents),
+            (Some(true), Some(false), Some(false), Some(599))
+        );
+    }
+
+    fn amazon_offer(buy_box: &str) -> Observation {
+        let html = format!(
+            r##"<html><head><title>Amazon.com: Thing</title></head><body>
+            <span id="productTitle">Thing</span>
+            <div id="corePriceDisplay_desktop_feature_div"><span class="a-price priceToPay"><span class="a-offscreen">$15.95</span></span></div>
+            {buy_box}</body></html>"##
+        );
+        parse("amazon", &html).unwrap()
+    }
+
+    #[test]
+    fn amazon_page_says_who_sells_ships_and_what_delivery_costs() {
+        let line = |name: &str, value: &str| {
+            format!(
+                r#"<div offer-display-feature-name="desktop-{name}" class="offer-display-feature-text">
+                   <span class="a-size-small offer-display-feature-text-message">{value}</span></div>"#
+            )
+        };
+        let delivery = |price: &str| {
+            format!(r#"<div id="deliveryBlockMessage"><span data-csa-c-delivery-price="{price}">delivery</span></div>"#)
+        };
+
+        // One line when Amazon both ships and sells.
+        let own = amazon_offer(&format!("{}{}", line("merchant-info", "Amazon.com"), delivery("FREE")));
+        assert_eq!(own.seller.as_deref(), Some("Amazon.com"));
+        assert_eq!(
+            (own.third_party, own.store_ships, own.ships_free, own.shipping_cents),
+            (Some(false), Some(true), Some(true), None)
+        );
+
+        // Another seller, shipped by Amazon.
+        let shipped = amazon_offer(&format!("{}{}", line("fulfiller-info", "Amazon"), line("merchant-info", "Lambcare")));
+        assert_eq!(shipped.seller.as_deref(), Some("Lambcare"));
+        assert_eq!((shipped.third_party, shipped.store_ships, shipped.ships_free), (Some(true), Some(true), None));
+
+        // Another seller that ships it itself and charges for it.
+        let charged = amazon_offer(&format!("{}{}", line("merchant-info", "Infinite Finds"), delivery("$6.99")));
+        assert_eq!(
+            (charged.third_party, charged.store_ships, charged.ships_free, charged.shipping_cents),
+            (Some(true), Some(false), Some(false), Some(699))
+        );
+
+        // A page without a buying box says nothing.
+        let bare = amazon_offer("");
+        assert_eq!((bare.seller, bare.third_party, bare.store_ships, bare.ships_free), (None, None, None, None));
     }
 
     #[test]

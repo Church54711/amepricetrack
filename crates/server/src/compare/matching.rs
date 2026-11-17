@@ -165,16 +165,24 @@ fn numbers(title: &str) -> HashSet<String> {
 /// Returned per unit, so 500 sheets can be told apart from 5000 sheets.
 fn quantities(title: &str) -> std::collections::HashMap<&'static str, HashSet<String>> {
     static RE_QUANTITY: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)(\d+(?:\.\d+)?)[\s-]*(sheets?|reams?|packs?|pk|count|ct|pieces?|pcs?|oz|ounces?|lbs?|pounds?|gb|tb|gal|gallons?|qt|quarts?|ml|ft|feet|rolls?|pairs?)\b")
+        Regex::new(r"(?i)(\d+(?:\.\d+)?)[\s/-]*(sheets?|reams?|packs?|pk|count|ct|pieces?|pcs?|oz|ounces?|lbs?|pounds?|gb|tb|gal|gallons?|qt|quarts?|ml|ft|feet|rolls?|pairs?)\b")
             .unwrap()
     });
+    /// "Pack of 3", "Box of 12".
+    static RE_PACK_OF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:pack|box|case|set) of (\d+)\b").unwrap());
+    let title = title.replace(',', "");
     let mut found: std::collections::HashMap<&'static str, HashSet<String>> = std::collections::HashMap::new();
-    for cap in RE_QUANTITY.captures_iter(&title.replace(',', "")) {
+    for cap in RE_PACK_OF.captures_iter(&title) {
+        found.entry("pack").or_default().insert(cap[1].to_string());
+    }
+    for cap in RE_QUANTITY.captures_iter(&title) {
         let unit = match cap[2].to_ascii_lowercase().trim_end_matches('s') {
             "sheet" => "sheets",
             "ream" => "reams",
             "pack" | "pk" => "pack",
-            "count" | "ct" | "piece" | "pc" => "count",
+            "count" | "ct" => "count",
+            // Pieces make up one set (a 6-piece towel set); they are not a number of items.
+            "piece" | "pc" => "pieces",
             "oz" | "ounce" => "oz",
             "lb" | "pound" => "lb",
             "gb" => "gb",
@@ -196,6 +204,82 @@ fn quantities(title: &str) -> std::collections::HashMap<&'static str, HashSet<St
 fn quantity_clash(a: &str, b: &str) -> bool {
     let (qa, qb) = (quantities(a), quantities(b));
     qa.iter().any(|(unit, numbers)| qb.get(unit).is_some_and(|other| numbers.is_disjoint(other)))
+}
+
+/// Units that count how many of the item a purchase holds. A different
+/// number of these is the same item in another pack size; a different
+/// number of ounces or gigabytes is a different item.
+const COUNTED: &[&str] = &["sheets", "reams", "pack", "count", "rolls", "pairs"];
+
+/// The same item sold in two different amounts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackDiff {
+    /// How many the tracked product holds.
+    pub source_qty: f64,
+    /// How many the other listing holds.
+    pub other_qty: f64,
+    /// What is counted: one of `COUNTED`.
+    pub unit: String,
+}
+
+impl PackDiff {
+    /// What `cents` for the other listing comes to for the tracked product's amount.
+    pub fn equivalent(&self, cents: i64) -> i64 {
+        (cents as f64 * self.source_qty / self.other_qty).round() as i64
+    }
+}
+
+/// How an amount reads in a sentence: "500 sheets", "pack of 3", "1 roll".
+pub fn amount_text(qty: f64, unit: &str) -> String {
+    let number = if qty.fract() == 0.0 { format!("{qty:.0}") } else { format!("{qty}") };
+    let one = qty == 1.0;
+    match unit {
+        "pack" if one => "single".into(),
+        "pack" => format!("pack of {number}"),
+        "count" => format!("{number} count"),
+        "sheets" => format!("{number} {}", if one { "sheet" } else { "sheets" }),
+        "reams" => format!("{number} {}", if one { "ream" } else { "reams" }),
+        "rolls" => format!("{number} {}", if one { "roll" } else { "rolls" }),
+        "pairs" => format!("{number} {}", if one { "pair" } else { "pairs" }),
+        other => format!("{number} {other}"),
+    }
+}
+
+/// When two names differ only in how many of the item they hold, by how much.
+/// None when they hold the same amount, when a size (ounces, gigabytes)
+/// differs too, or when the counts do not tell one clear story.
+pub fn pack_difference(source: &str, other: &str) -> Option<PackDiff> {
+    let (qa, qb) = (quantities(source), quantities(other));
+    let mut found: Option<PackDiff> = None;
+    // In a fixed order, so the answer does not depend on how the names were stored.
+    let mut units: Vec<&&'static str> = qa.keys().collect();
+    units.sort();
+    for unit in units {
+        let (Some(numbers), Some(theirs)) = (qa.get(*unit), qb.get(*unit)) else { continue };
+        if !numbers.is_disjoint(theirs) {
+            continue;
+        }
+        // The names disagree on this unit.
+        if !COUNTED.contains(unit) || numbers.len() != 1 || theirs.len() != 1 {
+            return None;
+        }
+        let amount = |set: &HashSet<String>| set.iter().next().and_then(|n| n.parse::<f64>().ok()).filter(|n| *n > 0.0);
+        let (Some(source_qty), Some(other_qty)) = (amount(numbers), amount(theirs)) else {
+            return None;
+        };
+        match &found {
+            // "10 reams, 5000 sheets" against "1 ream, 500 sheets" say the same thing twice.
+            Some(known) if (known.other_qty / known.source_qty - other_qty / source_qty).abs() < 1e-6 => {
+                // Keep the smaller unit: it is the one people price by.
+                if *unit == "sheets" {
+                    found = Some(PackDiff { source_qty, other_qty, unit: unit.to_string() });
+                }
+            }
+            Some(_) => return None,
+            None => found = Some(PackDiff { source_qty, other_qty, unit: unit.to_string() }),
+        }
+    }
+    found
 }
 
 const COLOURS: &[&str] = &[
@@ -327,6 +411,8 @@ pub fn judge(source: &Facts, candidate: &Facts) -> Verdict {
     };
 
     let similarity = name_similarity(source, candidate);
+    // The same item in another pack size is still worth comparing, per item.
+    let pack = pack_difference(&source.title, &candidate.title);
     let number_clash = {
         let (na, nb) = (numbers(&source.title), numbers(&candidate.title));
         !na.is_empty() && !nb.is_empty() && na.is_disjoint(&nb)
@@ -352,6 +438,8 @@ pub fn judge(source: &Facts, candidate: &Facts) -> Verdict {
         if similarity_ignoring(source, candidate, &all_codes) < 0.2 {
             verdict = Verdict { score: 75, reason: "Same model number, different name" };
         } else if let (Some(a), Some(b)) = (source.price_cents, candidate.price_cents) {
+            // Compared for the same amount when the pack sizes differ.
+            let b = pack.as_ref().map_or(b, |p| p.equivalent(b));
             let ratio = b as f64 / a.max(1) as f64;
             if !(0.4..=2.5).contains(&ratio) {
                 verdict = Verdict { score: 75, reason: "Same model number, very different price" };
@@ -360,7 +448,9 @@ pub fn judge(source: &Facts, candidate: &Facts) -> Verdict {
     }
     // One model number often covers several pack sizes (a ream and a carton).
     if quantity_clash(&source.title, &candidate.title) {
-        if verdict.score >= SAME {
+        if pack.is_some() && verdict.score >= SAME {
+            verdict.reason = "Same model number, different pack size";
+        } else if verdict.score >= SAME {
             verdict = Verdict { score: 78, reason: "Same model number, different size or quantity" };
         } else {
             verdict.score = verdict.score.saturating_sub(15);
@@ -380,7 +470,10 @@ pub fn judge(source: &Facts, candidate: &Facts) -> Verdict {
         verdict.reason = "Different brand";
     }
     // Two different barcodes usually mean a different pack size or colour.
-    if barcodes_differ && verdict.score >= SAME {
+    // A pack size that is known to differ explains them.
+    if barcodes_differ && verdict.score >= SAME && pack.is_some() {
+        // Still the same item, in another amount.
+    } else if barcodes_differ && verdict.score >= SAME {
         verdict = Verdict { score: 80, reason: "Same model number, different barcode" };
     } else if barcodes_differ {
         verdict.score = verdict.score.min(70);
@@ -532,12 +625,46 @@ mod tests {
         );
         let ream =
             facts("Hammermill Copy Plus Copy Paper, 20 lbs., 500 Sheets/Ream (105007)", Some("Hammermill"), Some("105007"), None);
-        assert_eq!(judge(&carton, &ream), Verdict { score: 78, reason: "Same model number, different size or quantity" });
+        // A carton and a ream of the same paper: the same item, ten times the amount.
+        assert_eq!(judge(&carton, &ream), Verdict { score: 92, reason: "Same model number, different pack size" });
+        let diff = pack_difference(&carton.title, &ream.title).unwrap();
+        assert_eq!((diff.source_qty, diff.other_qty, diff.unit.as_str()), (5000.0, 500.0, "sheets"));
+        assert_eq!(diff.equivalent(799), 7990, "a $7.99 ream is $79.90 for a carton's worth");
+        // A different size of thing is not a pack size.
+        let small = facts("Shampoo 12 oz (SH100)", Some("Acme"), Some("SH100"), None);
+        let large = facts("Shampoo 24 oz (SH100)", Some("Acme"), Some("SH100"), None);
+        assert_eq!(judge(&small, &large), Verdict { score: 78, reason: "Same model number, different size or quantity" });
+        assert_eq!(pack_difference(&small.title, &large.title), None);
         let same_carton = facts("Hammermill Copy Plus Paper, 20lb, 5,000 Sheets / Case (105007)", Some("Hammermill"), None, None);
         assert!(judge(&carton, &same_carton).score >= SAME);
         assert!(!quantity_clash("SSD 512GB", "SSD 1TB 512 GB cache"));
         assert!(quantity_clash("Towels 2-Pack", "Towels, 6 Pack"));
         assert!(!quantity_clash("Towels 2-Pack", "Towels"), "nothing to disagree with");
+    }
+
+    #[test]
+    fn pack_sizes_are_read_from_names() {
+        let diff = |a: &str, b: &str| pack_difference(a, b).map(|d| (d.source_qty, d.other_qty, d.unit));
+        assert_eq!(diff("AA Batteries, 8 Pack", "AA Batteries 24-Pack"), Some((8.0, 24.0, "pack".into())));
+        assert_eq!(diff("Sticky Notes, Pack of 12", "Sticky Notes 24/Pack"), Some((12.0, 24.0, "pack".into())));
+        assert_eq!(diff("Paper Towels, 6 Rolls", "Paper Towels 12 Rolls"), Some((6.0, 12.0, "rolls".into())));
+        // Reams and sheets telling the same story count once, by the sheet.
+        assert_eq!(
+            diff("Copy Paper 10 Reams 5000 Sheets", "Copy Paper 1 Ream, 500 Sheets"),
+            Some((5000.0, 500.0, "sheets".into()))
+        );
+        // The same amount, no stated amount, or two stories: nothing to say.
+        assert_eq!(diff("AA Batteries 8 Pack", "AA Batteries (8-Pack)"), None);
+        assert_eq!(diff("Towels 2-Pack", "Towels"), None);
+        assert_eq!(diff("Pens 2 Pack, 12 Count", "Pens 4 Pack, 12 Count"), Some((2.0, 4.0, "pack".into())));
+        assert_eq!(diff("Pens 2 Pack, 12 Count", "Pens 3 Pack, 60 Count"), None);
+        // Pieces of a set and sizes are not pack sizes.
+        assert_eq!(diff("Towel Set 6-Piece", "Towel Set 2-Piece"), None);
+        assert_eq!(diff("SSD 512GB", "SSD 1024GB"), None);
+
+        assert_eq!(amount_text(3.0, "pack"), "pack of 3");
+        assert_eq!(amount_text(1.0, "pack"), "single");
+        assert_eq!(amount_text(500.0, "sheets"), "500 sheets");
     }
 
     #[test]

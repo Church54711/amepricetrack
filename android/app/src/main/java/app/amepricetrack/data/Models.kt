@@ -21,6 +21,14 @@ data class Product(
     val lowestPriceCents: Long?,
     val lastSuccessAt: Long?,
     val lastError: String?,
+    val model: String? = null,
+    val barcode: String? = null,
+    /** The store's own item number. */
+    val itemNumber: String? = null,
+    /** Who sells it, at stores that host other sellers. */
+    val seller: String? = null,
+    /** True when that seller is not the store itself. */
+    val thirdParty: Boolean? = null,
 ) {
     val displayTitle: String get() = title ?: url
 }
@@ -40,9 +48,18 @@ data class Price(
     val memberCents: Long?,
     val discountName: String?,
     val discountPercent: Double?,
-    /** What this person would actually pay. */
+    /** What this person would actually pay for the item itself. */
     val yourCents: Long?,
+    /** What delivery adds: 0 when free or covered by a membership, null when the store does not say. */
+    val shippingCents: Long? = null,
+    /** Delivery is charged, but the store does not say how much. */
+    val shippingExtra: Boolean = false,
+    /** The membership that makes delivery free, when one applies. */
+    val shippingMembership: String? = null,
 ) {
+    /** The item and its delivery together. */
+    val totalCents: Long? get() = yourCents?.let { it + (shippingCents ?: 0) }
+
     val isPersonal: Boolean
         get() = (yourCents != null && publicCents != null && yourCents < publicCents) || (publicCents == null && memberCents != null)
 }
@@ -80,10 +97,26 @@ data class OtherStore(
     /** "rules" or "ai". */
     val judgedBy: String,
     val product: Product?,
+    /** What the listing costs this person there, before delivery. */
     val yourCents: Long?,
+    val shippingCents: Long? = null,
+    val shippingExtra: Boolean = false,
+    /** The figure to compare: listing plus delivery, for the same amount as the tracked product. */
+    val equivalentCents: Long? = null,
+    /** "500 sheets": how much the other listing holds, when that differs. */
+    val theirAmount: String? = null,
+    /** "5000 sheets": how much the tracked product holds, when that differs. */
+    val yourAmount: String? = null,
+    /** The offer comes from a marketplace seller, not the store itself. */
+    val marketplace: Boolean = false,
 ) {
     /** A match the AI made that the person has not confirmed. */
     val aiJudged: Boolean get() = judgedBy == "ai" && !confirmed
+
+    /** True when this store can be shown to the tracked store as a lower price for the identical item. */
+    fun worthMatching(trackedTotalCents: Long?): Boolean =
+        status == "found" && theirAmount == null && product != null &&
+            equivalentCents != null && trackedTotalCents != null && equivalentCents < trackedTotalCents
 }
 
 data class ProductDetail(val item: WatchItem, val history: List<PricePoint>, val otherStores: List<OtherStore>)
@@ -117,7 +150,23 @@ data class CollectEntry(
     val url: String,
     /** True when the server cannot read this product itself. */
     val needed: Boolean,
+    /** When any reader last got this product's price, in seconds. */
+    val lastSuccessAt: Long? = null,
 )
+
+/** A store that can be searched, as the server names it. */
+data class StoreRef(val id: String, val name: String)
+
+/** A product already on the watchlist. */
+data class TrackedRef(val productId: Long, val title: String, val storeName: String)
+
+/** The start of a find: the words tidied by the server and where to look. */
+data class FindStart(val query: String, val barcode: Boolean, val stores: List<StoreRef>, val tracked: List<TrackedRef>)
+
+data class FindItem(val title: String, val url: String)
+
+/** One store's search results. */
+data class FindAnswer(val storeName: String, val results: List<FindItem>, val problem: String?)
 
 data class IngestResult(val priceCents: Long?, val recordedAs: String)
 
@@ -147,6 +196,11 @@ fun parseProduct(o: JSONObject) = Product(
     lowestPriceCents = o.long("lowest_price_cents"),
     lastSuccessAt = o.long("last_success_at"),
     lastError = o.text("last_error"),
+    model = o.text("model"),
+    barcode = o.text("gtin"),
+    itemNumber = o.text("retailer_sku"),
+    seller = o.text("seller"),
+    thirdParty = o.bool("third_party"),
 )
 
 fun parseWatchItem(o: JSONObject): WatchItem {
@@ -169,6 +223,9 @@ fun parseWatchItem(o: JSONObject): WatchItem {
             discountName = price.text("discount_name"),
             discountPercent = price.double("discount_percent"),
             yourCents = price.long("your_cents"),
+            shippingCents = price.long("shipping_cents"),
+            shippingExtra = price.optBoolean("shipping_extra", false),
+            shippingMembership = price.text("shipping_membership"),
         ),
         deal = Deal(
             usualCents = deal.long("usual_cents"),
@@ -201,6 +258,13 @@ fun parseProductDetail(o: JSONObject) = ProductDetail(
             judgedBy = comparison.optString("judged_by", "rules"),
             product = row.child("product")?.let(::parseProduct),
             yourCents = row.long("your_cents"),
+            shippingCents = row.long("shipping_cents"),
+            shippingExtra = row.optBoolean("shipping_extra", false),
+            // Older servers do not send this; the listing's own price is the best stand-in.
+            equivalentCents = row.long("equivalent_cents") ?: row.long("your_cents"),
+            theirAmount = row.text("their_amount"),
+            yourAmount = row.text("your_amount"),
+            marketplace = row.optBoolean("marketplace", false),
         )
     },
 )
@@ -231,10 +295,32 @@ fun parseMe(o: JSONObject) = Me(
 
 fun parseCollect(o: JSONObject): List<CollectEntry> {
     fun entries(key: String, needed: Boolean) = o.optJSONArray(key).mapObjects {
-        CollectEntry(it.optLong("product_id"), it.optString("store_name"), it.text("title") ?: it.optString("url"), it.optString("url"), needed)
+        CollectEntry(
+            productId = it.optLong("product_id"),
+            storeName = it.optString("store_name"),
+            title = it.text("title") ?: it.optString("url"),
+            url = it.optString("url"),
+            needed = needed,
+            lastSuccessAt = it.long("last_success_at"),
+        )
     }
     return entries("needed", true) + entries("optional", false)
 }
+
+fun parseFindStart(o: JSONObject) = FindStart(
+    query = o.optString("query"),
+    barcode = o.optBoolean("barcode", false),
+    stores = o.optJSONArray("stores").mapObjects { StoreRef(it.optString("id"), it.optString("name")) },
+    tracked = o.optJSONArray("tracked").mapObjects {
+        TrackedRef(it.optLong("product_id"), it.optString("title"), it.optString("store_name"))
+    },
+)
+
+fun parseFindAnswer(o: JSONObject) = FindAnswer(
+    storeName = o.optString("store_name"),
+    results = o.optJSONArray("results").mapObjects { FindItem(it.optString("title"), it.optString("url")) },
+    problem = o.text("problem"),
+)
 
 // ------------------------------------------------------------------ small helpers
 
@@ -251,6 +337,29 @@ fun decodeJavascriptString(value: String?): String {
         ""
     }
 }
+
+/**
+ * Small packages carry a short barcode (UPC-E). Stores list the full
+ * twelve-digit one, so a scanned short code is written out in full:
+ * "04252614" -> "042100005264". Anything else is returned as it came.
+ */
+fun expandShortBarcode(code: String): String {
+    if (code.length != 8 || !code.all { it.isDigit() } || code[0] !in "01") return code
+    val system = code[0]
+    val d = code.substring(1, 7)
+    val check = code[7]
+    val body = when (d[5]) {
+        '0', '1', '2' -> d.substring(0, 2) + d[5] + "0000" + d.substring(2, 5)
+        '3' -> d.substring(0, 3) + "00000" + d.substring(3, 5)
+        '4' -> d.substring(0, 4) + "00000" + d[4]
+        else -> d.substring(0, 5) + "0000" + d[5]
+    }
+    return "$system$body$check"
+}
+
+/** True when the text holds a web link, as opposed to a name or barcode to look up. */
+fun looksLikeLink(text: String): Boolean =
+    text.length < 2000 && (Regex("""https?://\S+""").containsMatchIn(text) || Regex("""^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}(/\S*)?$""").matches(text.trim()))
 
 /** 123456 -> "$1,234.56" */
 fun dollars(cents: Long): String = NumberFormat.getCurrencyInstance(Locale.US).format(cents / 100.0)

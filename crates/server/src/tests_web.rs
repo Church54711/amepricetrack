@@ -12,6 +12,12 @@ async fn site() -> Router {
     super::routes().merge(crate::api::routes()).with_state(test_app().await)
 }
 
+/// The site together with the app behind it, for tests that prepare data directly.
+async fn site_and_app() -> (Router, crate::App) {
+    let app = test_app().await;
+    (super::routes().merge(crate::api::routes()).with_state(app.clone()), app)
+}
+
 async fn send(site: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
     let response = site.clone().oneshot(request).await.unwrap();
     let (parts, body) = response.into_parts();
@@ -117,7 +123,9 @@ async fn every_page_renders_for_a_signed_in_person() {
     }
     let (status, _, _) = send(&site, get("/products/999", &cookie)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, headers, _) = send(&site, post_form("/watches", &cookie, "url=nonsense+text")).await;
+    // A link that is not a product page is refused with the reason.
+    let (status, headers, _) =
+        send(&site, post_form("/watches", &cookie, "url=https%3A%2F%2Fwww.walmart.com%2Fsearch%3Fq%3Dchair")).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(location(&headers).starts_with("/?err="));
 }
@@ -272,4 +280,128 @@ async fn matching_model_is_saved_with_the_ai_settings() {
     assert!(body.contains(r#"name="match_model" value="claude-haiku-5-5""#), "the matching model is shown back");
     assert!(body.contains("a good choice here: claude-haiku-5-5"));
     assert!(!body.contains("sk-test"), "the key is never shown back");
+}
+
+#[tokio::test]
+async fn a_name_or_barcode_typed_instead_of_a_link_goes_to_find() {
+    let site = site().await;
+    let cookie = set_up(&site).await;
+
+    // Words in the add box are searched for, not treated as a broken link.
+    let (status, headers, _) = send(&site, post_form("/watches", &cookie, "url=hammermill+copy+paper")).await;
+    assert_eq!((status, location(&headers)), (StatusCode::SEE_OTHER, "/find?q=hammermill+copy+paper"));
+    let (status, _, body) = send(&site, get("/find?q=hammermill+copy+paper", &cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Find a product") && body.contains("Stores searched for"), "{body}");
+    for store in ["Staples", "Walmart", "Hot Topic"] {
+        assert!(body.contains(&format!("<h2>{store}</h2>")), "{store} is listed");
+    }
+    assert!(body.contains(r#"data-store="walmart""#) && body.contains("find-waiting"));
+
+    // A scanned barcode is recognised and written the way stores list it.
+    let (_, _, body) = send(&site, get("/find?q=0195951039305", &cookie)).await;
+    assert!(body.contains("Stores searched for the barcode") && body.contains(r#"data-query="195951039305""#), "{body}");
+
+    // Too short to search for: back to the watchlist with the reason.
+    let (status, headers, _) = send(&site, get("/find?q=ab", &cookie)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location(&headers).starts_with("/?err="));
+    let (status, _, body) = send(&site, get("/find/store?q=copy+paper&store=nowhere", &cookie)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("cannot be searched"));
+
+    // The phone app starts a find the same way.
+    let login = json!({ "username": "sam", "password": "longenough" });
+    let (_, _, body) = send(&site, post_json("/api/v1/login", "", login)).await;
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (status, _, body) = send(&site, get_api("/api/v1/find?q=0195951039305", &token)).await;
+    let start: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((start["query"].as_str(), start["barcode"].as_bool()), (Some("195951039305"), Some(true)));
+    assert_eq!(start["stores"][0]["id"], "staples");
+    assert_eq!(start["tracked"], json!([]));
+}
+
+#[tokio::test]
+async fn price_match_card_shows_both_sides_and_what_to_check() {
+    use crate::db::{self, Audience};
+    use crate::retailers::{Observation, ProductRef};
+
+    let (site, app) = site_and_app().await;
+    let cookie = set_up(&site).await;
+    send(&site, post_form("/watches", &cookie, ADD_CHAIR)).await;
+    let chair =
+        Observation { title: Some("Office Chair".into()), price_cents: Some(10000), in_stock: Some(true), ..Default::default() };
+    db::record_observation(&app.db, 1, &chair, "server", Audience::Public, None, Some(60)).await.unwrap();
+
+    // The same chair at Walmart for $90, from a marketplace seller.
+    let reference = ProductRef { retailer: "walmart".into(), sku: "777".into(), url: "https://www.walmart.com/ip/777".into() };
+    let other = db::upsert_product(&app.db, &reference).await.unwrap();
+    let offer = Observation {
+        title: Some("Office Chair, Black".into()),
+        price_cents: Some(9000),
+        in_stock: Some(true),
+        seller: Some("Seats Direct".into()),
+        third_party: Some(true),
+        ..Default::default()
+    };
+    db::record_observation(&app.db, other, &offer, "server", Audience::Public, None, Some(60)).await.unwrap();
+    sqlx::query(
+        "UPDATE comparisons SET status = 'found', product_id = ?, score = 100, reason = 'Same barcode'
+         WHERE source_product_id = 1 AND retailer = 'walmart'",
+    )
+    .bind(other)
+    .execute(&app.db)
+    .await
+    .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM comparisons WHERE retailer = 'walmart'").fetch_one(&app.db).await.unwrap();
+
+    // The product page offers the card for the store that is cheaper.
+    let (_, _, body) = send(&site, get("/products/1", &cookie)).await;
+    assert!(body.contains(&format!(r#"href="/comparisons/{id}/match""#)), "{body}");
+    assert!(body.contains("Marketplace seller: Seats Direct"));
+
+    let (status, _, body) = send(&site, get(&format!("/comparisons/{id}/match"), &cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Show this at Staples when asking them to match the price at Walmart."), "{body}");
+    assert!(body.contains("$10.00 lower at Walmart"));
+    assert!(body.contains("Sold by Seats Direct, a marketplace seller"));
+    assert!(body.contains("Matched by: Same barcode"));
+    assert!(body.contains(r#"href="https://www.walmart.com/ip/777""#));
+
+    // "Check again" queues both products for an immediate check.
+    sqlx::query("UPDATE products SET next_check_at = 9999999999").execute(&app.db).await.unwrap();
+    let (status, headers, _) = send(&site, post_form(&format!("/comparisons/{id}/refresh"), &cookie, "")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location(&headers).starts_with(&format!("/comparisons/{id}/match?msg=")));
+    let due: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM products WHERE next_check_at = 0").fetch_one(&app.db).await.unwrap();
+    assert_eq!(due, 2);
+
+    // A store that has not been searched, or someone else's comparison, has no card.
+    let (status, _, _) = send(&site, get("/comparisons/9999/match", &cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let pending: i64 =
+        sqlx::query_scalar("SELECT id FROM comparisons WHERE retailer = 'target'").fetch_one(&app.db).await.unwrap();
+    let (status, _, _) = send(&site, get(&format!("/comparisons/{pending}/match"), &cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_membership_with_free_delivery_needs_no_percent() {
+    let site = site().await;
+    let cookie = set_up(&site).await;
+    let (_, headers, _) =
+        send(&site, post_form("/discounts", &cookie, "retailer=amazon&name=Prime&percent=&free_shipping=on")).await;
+    assert!(location(&headers).starts_with("/discounts?msg="), "{}", location(&headers));
+    let (_, _, body) = send(&site, get("/discounts", &cookie)).await;
+    assert!(body.contains(r#"value="Prime""#) && body.contains("Free delivery on what Amazon ships itself"), "{body}");
+
+    // Neither a percent nor free delivery is nothing to add.
+    let (_, headers, _) = send(&site, post_form("/discounts", &cookie, "retailer=amazon&name=Nothing&percent=")).await;
+    assert!(location(&headers).starts_with("/discounts?err="));
+
+    // The setting that leaves marketplace sellers out is saved.
+    send(&site, post_form("/settings/compare", &cookie, "auto_compare=on&ignore_marketplace=on")).await;
+    let (_, _, body) = send(&site, get("/settings", &cookie)).await;
+    assert!(body.contains(r#"name="ignore_marketplace" checked"#), "the box stays ticked");
 }

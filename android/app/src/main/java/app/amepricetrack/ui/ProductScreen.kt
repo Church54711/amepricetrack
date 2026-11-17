@@ -64,7 +64,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
-fun ProductScreen(app: App, productId: Long, onBack: () -> Unit, onRemoved: () -> Unit) {
+fun ProductScreen(app: App, productId: Long, onBack: () -> Unit, onRemoved: () -> Unit, onPriceMatch: (Long) -> Unit) {
     var state by remember(productId) { mutableStateOf<Load<ProductDetail>>(Load.Loading) }
     var confirmRemove by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
@@ -149,6 +149,15 @@ fun ProductScreen(app: App, productId: Long, onBack: () -> Unit, onRemoved: () -
                         } else {
                             Muted(item.product.lastError?.let { "Could not read the price: $it" } ?: "The first price check is running.")
                         }
+                        val delivery = item.price.shippingCents
+                        when {
+                            delivery != null && delivery > 0 -> Muted("Plus ${dollars(delivery)} delivery.")
+                            item.price.shippingExtra -> Muted("Delivery is charged on top; the store does not say how much.")
+                            item.price.shippingMembership != null -> Muted("Free delivery with ${item.price.shippingMembership}.")
+                        }
+                        if (item.product.thirdParty == true) {
+                            Muted("Sold by ${item.product.seller ?: "another seller"}, a marketplace seller, not by ${item.storeName} itself.")
+                        }
                         Badges(item)
                         item.deal.usualCents?.let { Muted("Usual price over 90 days: ${dollars(it)}") }
                         item.product.lowestPriceCents?.let { Muted("Lowest recorded: ${dollars(it)}") }
@@ -167,6 +176,8 @@ fun ProductScreen(app: App, productId: Long, onBack: () -> Unit, onRemoved: () -
 
                     OtherStoresCard(
                         stores = detail.otherStores,
+                        trackedTotalCents = item.price.totalCents,
+                        onPriceMatch = { store -> onPriceMatch(store.comparisonId) },
                         onOpenProduct = { url -> runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } },
                         onDecide = { store, same ->
                             act(if (same) "Marked as the same product." else "Marked as a different product.") {
@@ -248,6 +259,8 @@ private fun PriceChart(history: List<PricePoint>) {
 @Composable
 private fun OtherStoresCard(
     stores: List<OtherStore>,
+    trackedTotalCents: Long?,
+    onPriceMatch: (OtherStore) -> Unit,
     onOpenProduct: (String) -> Unit,
     onDecide: (OtherStore, Boolean) -> Unit,
     onSearchAgain: () -> Unit,
@@ -265,7 +278,8 @@ private fun OtherStoresCard(
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text(store.storeName, fontWeight = FontWeight.Medium)
-                    store.yourCents?.takeIf { store.product != null }?.let { Text(dollars(it), fontWeight = FontWeight.Bold) }
+                    // The figure that can be compared: delivery included, for the same amount as the tracked product.
+                    store.equivalentCents?.takeIf { store.product != null }?.let { Text(dollars(it), fontWeight = FontWeight.Bold) }
                 }
                 val found = store.product
                 when {
@@ -280,8 +294,19 @@ private fun OtherStoresCard(
                             if (store.aiJudged) Tag("Judged by AI", TagKind.Plain) else if (store.confirmed) Tag("Confirmed by you", TagKind.Plain)
                             if (found.inStock == false) Tag("Out of stock", TagKind.Bad)
                         }
+                        if (store.marketplace) Tag("Marketplace seller" + (found.seller?.let { ": $it" } ?: ""), TagKind.Warn)
+                        // What the figure is made of, when it is not simply the listed price.
+                        val listed = store.yourCents
+                        if (store.theirAmount != null && store.yourAmount != null && listed != null) {
+                            Muted("Sold as ${store.theirAmount} for ${dollars(listed)}. The price shown is for ${store.yourAmount}, the amount you track.")
+                        }
+                        val delivery = store.shippingCents
+                        if (delivery != null && delivery > 0) Muted("Includes ${dollars(delivery)} delivery.") else if (store.shippingExtra) Muted("Delivery is charged on top.")
                         store.reason?.let { Muted(it) }
                         Row {
+                            if (store.worthMatching(trackedTotalCents)) {
+                                TextButton(onClick = { onPriceMatch(store) }) { Text("Price match card") }
+                            }
                             if (store.status == "possible" || store.aiJudged) {
                                 TextButton(onClick = { onDecide(store, true) }) { Text("Yes, same product") }
                             }

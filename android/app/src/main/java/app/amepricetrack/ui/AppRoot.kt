@@ -54,12 +54,16 @@ import app.amepricetrack.Incoming
 import app.amepricetrack.data.SessionState
 import app.amepricetrack.data.normaliseServerAddress
 import app.amepricetrack.work.AlertWorker
+import app.amepricetrack.work.ReportWorker
 import kotlinx.coroutines.launch
 
 private const val TAB_WATCHLIST = "watchlist"
 private const val TAB_ALERTS = "alerts"
 private const val TAB_ASSISTANT = "assistant"
 private const val TAB_SETTINGS = "settings"
+
+/** Opening the app this long after the last automatic price report starts one. */
+private const val CATCH_UP_AFTER_MS = 6 * 3600 * 1000L
 
 /** The whole app: the sign-in screen, or the four tabs with detail screens on top. */
 @Composable
@@ -76,7 +80,7 @@ fun AppRoot(app: App, session: SessionState, incoming: Incoming?, onIncomingHand
 @Composable
 private fun SignedIn(app: App, incoming: Incoming?, onIncomingHandled: () -> Unit) {
     var tab by rememberSaveable { mutableStateOf(TAB_WATCHLIST) }
-    // Detail screens opened on top of the tabs: "product:12" or "phone".
+    // Detail screens opened on top of the tabs: "product:12", "phone", "find:copy paper" or "match:12:34".
     var stack by rememberSaveable { mutableStateOf(listOf<String>()) }
     var unread by remember { mutableIntStateOf(0) }
     // Raised to make the watchlist load again after something was added elsewhere.
@@ -97,6 +101,10 @@ private fun SignedIn(app: App, incoming: Incoming?, onIncomingHandled: () -> Uni
             unread = it.unreadAlerts
         }
         AlertWorker.schedule(app)
+        // Prices the phone reports by itself; catch up now if it has been a while.
+        ReportWorker.schedule(app, app.session.autoReport)
+        val sinceLast = System.currentTimeMillis() - app.session.lastReportAt
+        if (app.session.autoReport != "off" && sinceLast > CATCH_UP_AFTER_MS) ReportWorker.runSoon(app)
     }
 
     LaunchedEffect(incoming) {
@@ -131,8 +139,24 @@ private fun SignedIn(app: App, incoming: Incoming?, onIncomingHandled: () -> Uni
                     watchlistVersion++
                     back()
                 },
+                onPriceMatch = { comparison -> open("match:${top.removePrefix("product:")}:$comparison") },
             )
             top == "phone" -> PhoneScreen(app, onBack = back)
+            top.startsWith("find:") -> FindScreen(
+                app = app,
+                initial = top.removePrefix("find:"),
+                onBack = back,
+                onOpenProduct = { open("product:$it") },
+                onAdded = {
+                    watchlistVersion++
+                    // The new product takes the place of the search.
+                    stack = stack.dropLast(1) + "product:$it"
+                },
+            )
+            top.startsWith("match:") -> {
+                val (product, comparison) = top.removePrefix("match:").split(":").map { it.toLong() }
+                PriceMatchScreen(app, productId = product, comparisonId = comparison, onBack = back)
+            }
         }
         return
     }
@@ -189,6 +213,7 @@ private fun SignedIn(app: App, incoming: Incoming?, onIncomingHandled: () -> Uni
                     app = app,
                     version = watchlistVersion,
                     onOpen = { open("product:$it") },
+                    onFind = { open("find:$it") },
                     onMessage = { scope.launch { snackbar.showSnackbar(it) } },
                 )
                 TAB_ALERTS -> AlertsScreen(app, onOpen = { open("product:$it") }, onUnread = { unread = it })

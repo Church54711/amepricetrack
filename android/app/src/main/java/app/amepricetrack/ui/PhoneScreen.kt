@@ -2,12 +2,8 @@
 
 package app.amepricetrack.ui
 
-import android.annotation.SuppressLint
 import android.net.Uri
 import android.view.ViewGroup
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -50,67 +46,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import app.amepricetrack.App
 import app.amepricetrack.data.CollectEntry
-import app.amepricetrack.data.decodeJavascriptString
-import app.amepricetrack.data.dollars
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.delay
+import app.amepricetrack.work.PageReader
+import app.amepricetrack.work.PhoneReport
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.coroutines.resume
 
-/** The server accepts pages up to 12 MB; leave room for the rest of the request. */
-private const val MAX_PAGE_CHARS = 10_000_000
-
-/** A browser inside the app. Its cookies stay on the phone, so signing in at a store here is remembered. */
-private class StoreBrowser(val view: WebView) {
-    /** Completed when the page being loaded has finished. */
-    var pageDone: CompletableDeferred<Unit>? = null
-
-    /** Loads a page, waits for it to settle, and returns its HTML as rendered. */
-    suspend fun read(url: String): String {
-        val done = CompletableDeferred<Unit>()
-        pageDone = done
-        view.loadUrl(url)
-        withTimeoutOrNull(30_000) { done.await() }
-        // Stores fill in the price with scripts after the page itself has loaded.
-        delay(3500)
-        return suspendCancellableCoroutine { continuation ->
-            view.evaluateJavascript("document.documentElement.outerHTML") { value ->
-                continuation.resume(decodeJavascriptString(value))
-            }
-        }
-    }
-}
-
-@SuppressLint("SetJavaScriptEnabled") // store pages need their scripts to show a price
+/** The in-app browser, kept for as long as this screen is open. */
 @Composable
-private fun rememberStoreBrowser(): StoreBrowser {
+private fun rememberStoreBrowser(): PageReader {
     val context = LocalContext.current
-    val browser = remember {
-        val view = WebView(context)
-        view.layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        view.settings.javaScriptEnabled = true
-        view.settings.domStorageEnabled = true
-        CookieManager.getInstance().setAcceptCookie(true)
-        val holder = StoreBrowser(view)
-        view.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(webView: WebView, url: String) {
-                holder.pageDone?.complete(Unit)
-            }
-        }
-        holder
-    }
-    DisposableEffect(Unit) {
-        onDispose {
-            CookieManager.getInstance().flush()
-            browser.view.destroy()
-        }
-    }
+    val browser = remember { PageReader.create(context) }
+    DisposableEffect(Unit) { onDispose { browser.close() } }
     return browser
 }
-
-private fun hostOf(url: String): String = Uri.parse(url).host.orEmpty().removePrefix("www.")
 
 @Composable
 fun PhoneScreen(app: App, onBack: () -> Unit) {
@@ -136,27 +83,11 @@ fun PhoneScreen(app: App, onBack: () -> Unit) {
         scope.launch {
             for (entry in entries) {
                 current = entry.url
-                val html = browser.read(entry.url)
-                results[entry.productId] = when {
-                    html.length < 500 -> "The page did not load."
-                    html.length > MAX_PAGE_CHARS -> "The page is too large to send."
-                    else -> {
-                        // A store opened here before may be showing this person's own prices.
-                        val signedIn = hostOf(entry.url) in app.session.visitedStores
-                        val sent = app.attempt { app.api.ingest(entry.url, html, signedIn) }
-                        sent.fold(
-                            { result ->
-                                val price = result.priceCents?.let(::dollars) ?: "no price"
-                                if (result.recordedAs == "member") "$price, kept as your own price" else price
-                            },
-                            { sent.problem() },
-                        )
-                    }
-                }
+                results[entry.productId] = PhoneReport.reportOne(app, browser, entry).text
             }
             current = null
             running = false
-            browser.view.loadUrl("about:blank")
+            browser.rest()
         }
     }
 
@@ -226,6 +157,14 @@ fun PhoneScreen(app: App, onBack: () -> Unit) {
                                 }
                             }
                             Muted("Keep this screen open while it works; each page takes a few seconds.")
+                            Muted(
+                                when (app.session.autoReport) {
+                                    "off" -> "Automatic reports are off. You can turn them on in Settings."
+                                    else -> app.session.lastReportSummary?.let { summary ->
+                                        "Last automatic report, ${ago(app.session.lastReportAt / 1000)}: $summary"
+                                    } ?: "The phone also reports by itself; see Settings."
+                                },
+                            )
                         }
 
                         Card {
@@ -241,7 +180,7 @@ fun PhoneScreen(app: App, onBack: () -> Unit) {
                                     OutlinedButton(
                                         enabled = !running,
                                         onClick = {
-                                            app.session.visitedStores = app.session.visitedStores + hostOf(home)
+                                            app.session.visitedStores = app.session.visitedStores + PhoneReport.hostOf(home)
                                             browser.view.loadUrl(home)
                                             browsing = home
                                         },

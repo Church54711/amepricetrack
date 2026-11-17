@@ -43,6 +43,8 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.11.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    // Google's barcode scanner screen: no camera permission needed in this app.
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20251224")

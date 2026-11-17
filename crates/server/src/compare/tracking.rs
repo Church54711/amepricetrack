@@ -2,7 +2,7 @@
 //! that does the searching.
 
 use super::advisor::Advisor;
-use super::matching::{Facts, POSSIBLE, SAME};
+use super::matching::{amount_text, Facts, PackDiff, POSSIBLE, SAME};
 use super::{facts_of, find_at_store, stores, StoreResult};
 use crate::db::{self, Audience, Db, Product};
 use crate::pricing::{self, dollars};
@@ -30,9 +30,25 @@ pub struct Comparison {
     pub updated_at: i64,
     /// Who decided: "rules" (barcode, model number or name) or "ai".
     pub judged_by: String,
+    /// How many the tracked product holds, when the other listing holds a different amount.
+    pub source_qty: Option<f64>,
+    /// How many the other store's listing holds.
+    pub other_qty: Option<f64>,
+    /// What is counted ("pack", "sheets").
+    pub qty_unit: Option<String>,
 }
 
 impl Comparison {
+    /// The amounts, when the other store sells the same item in a different one.
+    pub fn pack(&self) -> Option<PackDiff> {
+        match (self.source_qty, self.other_qty, &self.qty_unit) {
+            (Some(source_qty), Some(other_qty), Some(unit)) if source_qty > 0.0 && other_qty > 0.0 => {
+                Some(PackDiff { source_qty, other_qty, unit: unit.clone() })
+            }
+            _ => None,
+        }
+    }
+
     /// A match the AI made that the person has not confirmed themselves.
     pub fn ai_judged(&self) -> bool {
         self.judged_by == "ai" && !self.confirmed
@@ -46,8 +62,40 @@ pub struct StoreRow {
     pub store_name: String,
     /// The product found there, for 'found' and 'possible'.
     pub product: Option<Product>,
-    /// What this person would pay there, after their discounts at that store.
+    /// What this person would pay there for the listing, after their discounts at that store.
     pub your_cents: Option<i64>,
+    /// What delivery adds there; 0 when free. None when the store does not say.
+    pub shipping_cents: Option<i64>,
+    /// Delivery is charged there, but the page does not say how much.
+    pub shipping_extra: bool,
+    /// The figure to compare with the tracked product: the listing plus
+    /// delivery, worked out for the same amount as the tracked product.
+    pub equivalent_cents: Option<i64>,
+    /// "500 sheets": how much the other listing holds, when that differs.
+    pub their_amount: Option<String>,
+    /// "5000 sheets": how much the tracked product holds, when that differs.
+    pub your_amount: Option<String>,
+    /// The offer comes from a marketplace seller, not the store itself.
+    pub marketplace: bool,
+}
+
+/// One other store's offer as this person would pay it.
+fn store_row(comparison: Comparison, store_name: String, product: Option<Product>, rules: &[db::DiscountRule]) -> StoreRow {
+    let view = product.as_ref().map(|p| pricing::view(p, None, rules)).unwrap_or_default();
+    let pack = comparison.pack();
+    let equivalent_cents = view.total_cents().map(|total| pack.as_ref().map_or(total, |p| p.equivalent(total)));
+    StoreRow {
+        store_name,
+        your_cents: view.your_cents,
+        shipping_cents: view.shipping_cents,
+        shipping_extra: view.shipping_extra,
+        equivalent_cents,
+        their_amount: pack.as_ref().map(|p| amount_text(p.other_qty, &p.unit)),
+        your_amount: pack.as_ref().map(|p| amount_text(p.source_qty, &p.unit)),
+        marketplace: product.as_ref().is_some_and(|p| p.third_party == Some(true)),
+        product,
+        comparison,
+    }
 }
 
 /// The cheapest confirmed match at another store.
@@ -143,34 +191,38 @@ pub async fn for_product(db: &Db, user_id: i64, source_product_id: i64) -> Resul
             Some(id) => db::product(db, id).await?,
             None => None,
         };
-        let your_cents = product.as_ref().and_then(|p| pricing::view(p, None, &rules).your_cents);
-        out.push(StoreRow { comparison, store_name: store.name, product, your_cents });
+        out.push(store_row(comparison, store.name, product, &rules));
     }
     Ok(out)
 }
 
-/// For each product a person tracks: the cheapest in-stock match elsewhere.
+/// True when an offer should be left out of comparisons for this person.
+fn left_out(row: &StoreRow, ignore_marketplace: bool) -> bool {
+    row.product.as_ref().is_none_or(|p| p.in_stock == Some(false)) || (ignore_marketplace && row.marketplace)
+}
+
+/// For each product a person tracks: the cheapest in-stock match elsewhere,
+/// delivery included, for the same amount as the tracked product.
 pub async fn best_elsewhere(db: &Db, user_id: i64) -> Result<HashMap<i64, Elsewhere>> {
-    let rows: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT source_product_id, product_id FROM comparisons
-         WHERE user_id = ? AND status = 'found' AND product_id IS NOT NULL",
-    )
-    .bind(user_id)
-    .fetch_all(db)
-    .await?;
+    let rows: Vec<Comparison> =
+        sqlx::query_as("SELECT * FROM comparisons WHERE user_id = ? AND status = 'found' AND product_id IS NOT NULL")
+            .bind(user_id)
+            .fetch_all(db)
+            .await?;
     let rules = db::rules(db, user_id).await?;
+    let ignore_marketplace = db::settings(db, user_id).await?.ignore_marketplace;
     let mut best: HashMap<i64, Elsewhere> = HashMap::new();
-    for (source_id, product_id) in rows {
+    for comparison in rows {
+        let (source_id, Some(product_id)) = (comparison.source_product_id, comparison.product_id) else { continue };
         let Some(product) = db::product(db, product_id).await? else { continue };
-        if product.in_stock == Some(false) {
+        let store_name = retailers::display_name(&product.retailer);
+        let row = store_row(comparison, store_name, Some(product), &rules);
+        let (Some(cents), Some(product)) = (row.equivalent_cents, &row.product) else { continue };
+        if left_out(&row, ignore_marketplace) {
             continue;
         }
-        let Some(cents) = pricing::view(&product, None, &rules).your_cents else { continue };
         if best.get(&source_id).is_none_or(|b| cents < b.cents) {
-            best.insert(
-                source_id,
-                Elsewhere { store_name: retailers::display_name(&product.retailer), product_id, url: product.url.clone(), cents },
-            );
+            best.insert(source_id, Elsewhere { store_name: row.store_name.clone(), product_id, url: product.url.clone(), cents });
         }
     }
     Ok(best)
@@ -187,36 +239,52 @@ pub async fn check_cheaper(app: &App, user_id: i64, source_product_id: i64) -> R
     }
     let rules = db::rules(&app.db, user_id).await?;
     let member = db::member_prices(&app.db, user_id).await?.get(&source_product_id).copied();
-    let Some(source_cents) = pricing::view(&source, member, &rules).your_cents else {
+    // Both sides are compared with delivery included.
+    let Some(source_cents) = pricing::view(&source, member, &rules).total_cents() else {
         return Ok(());
     };
+    let ignore_marketplace = db::settings(&app.db, user_id).await?.ignore_marketplace;
+    let source_store = retailers::display_name(&source.retailer);
     for row in for_product(&app.db, user_id, source_product_id).await? {
-        let (Some(product), Some(cents)) = (&row.product, row.your_cents) else { continue };
+        let (Some(product), Some(cents)) = (&row.product, row.equivalent_cents) else { continue };
         if row.comparison.status != "found" {
             continue;
         }
-        let cheaper = cents < source_cents && product.in_stock != Some(false);
+        let cheaper = cents < source_cents && !left_out(&row, ignore_marketplace);
         let already_told = row.comparison.last_notified_cents.is_some_and(|told| cents >= told);
         if cheaper && !already_told {
-            let title = format!(
-                "{}: {} here, {} at {}",
-                row.store_name,
-                dollars(cents),
-                dollars(source_cents),
-                retailers::display_name(&source.retailer)
-            );
-            // A match only the AI vouches for is announced as such.
-            let caveat = if row.comparison.ai_judged() {
-                " Your AI judged these to be the same product; check the listing before buying."
-            } else {
-                ""
+            let title = match &row.your_amount {
+                Some(amount) => {
+                    format!("{}: {} for {amount}, {} at {source_store}", row.store_name, dollars(cents), dollars(source_cents))
+                }
+                None => format!("{}: {} here, {} at {source_store}", row.store_name, dollars(cents), dollars(source_cents)),
             };
-            let body = format!(
-                "{}\nThe same product is {} cheaper at {}.{caveat}",
+            let mut body = format!(
+                "{}\nThe same product is {} cheaper at {}.",
                 source.display_title(),
                 dollars(source_cents - cents),
                 row.store_name
             );
+            // What the comparison rests on, so the person can check it.
+            if let (Some(theirs), Some(yours), Some(listed)) = (&row.their_amount, &row.your_amount, row.your_cents) {
+                body.push_str(&format!(
+                    " It is sold there as {theirs} for {}; the price above is for {yours}, the amount you track.",
+                    dollars(listed)
+                ));
+            }
+            if let Some(shipping) = row.shipping_cents.filter(|s| *s > 0) {
+                body.push_str(&format!(" That includes {} for delivery.", dollars(shipping)));
+            } else if row.shipping_extra {
+                body.push_str(" Delivery is charged on top there, and the page does not say how much.");
+            }
+            if row.marketplace {
+                let seller = product.seller.as_deref().unwrap_or("another seller");
+                body.push_str(&format!(" Sold by {seller}, a marketplace seller, not by {} itself.", row.store_name));
+            }
+            // A match only the AI vouches for is announced as such.
+            if row.comparison.ai_judged() {
+                body.push_str(" Your AI judged these to be the same product; check the listing before buying.");
+            }
             alerts::notify(app, user_id, Some(source_product_id), "cheaper", &title, &body, Some(cents), &product.url).await?;
         }
         // Remember the announced price; forget it once this store is no longer cheaper.
@@ -291,6 +359,18 @@ pub async fn run(app: App) {
     }
 }
 
+/// Records that the other store's listing holds a different amount of the same item.
+async fn set_pack(db: &Db, id: i64, pack: &PackDiff) -> Result<()> {
+    sqlx::query("UPDATE comparisons SET source_qty = ?, other_qty = ?, qty_unit = ? WHERE id = ?")
+        .bind(pack.source_qty)
+        .bind(pack.other_qty)
+        .bind(&pack.unit)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 async fn finish(
     db: &Db,
     id: i64,
@@ -300,8 +380,10 @@ async fn finish(
     reason: Option<&str>,
     judged_by: &str,
 ) -> Result<()> {
+    // A new answer starts without a pack difference; `set_pack` adds one.
     sqlx::query(
-        "UPDATE comparisons SET status = ?, product_id = ?, score = ?, reason = ?, judged_by = ?, updated_at = ? WHERE id = ?",
+        "UPDATE comparisons SET status = ?, product_id = ?, score = ?, reason = ?, judged_by = ?, updated_at = ?,
+            source_qty = NULL, other_qty = NULL, qty_unit = NULL WHERE id = ?",
     )
     .bind(status)
     .bind(product_id)
@@ -358,6 +440,9 @@ async fn search_one(app: &App, row: &Comparison) -> Result<()> {
             let status = if found.score >= SAME { "found" } else { "possible" };
             let judged_by = if found.by_ai { "ai" } else { "rules" };
             finish(&app.db, row.id, status, Some(product_id), Some(found.score as i64), Some(&found.reason), judged_by).await?;
+            if let Some(pack) = &found.pack {
+                set_pack(&app.db, row.id, pack).await?;
+            }
             check_cheaper(app, row.user_id, row.source_product_id).await
         }
         StoreResult::NotFound(note) => {
@@ -531,6 +616,85 @@ mod tests {
         decide(&app, user, row.comparison.id, true).await.unwrap();
         let row = for_product(&app.db, user, id).await.unwrap().into_iter().find(|r| r.comparison.retailer == "walmart").unwrap();
         assert!(!row.comparison.ai_judged(), "confirmed by the person");
+    }
+
+    #[tokio::test]
+    async fn another_pack_size_is_compared_for_the_same_amount() {
+        let app = test_app().await;
+        let user = db::create_user(&app.db, "sam", "h", true).await.unwrap();
+        // A carton of paper at Staples for $60; the same paper by the ream at Walmart for $5.
+        let id = tracked(&app, user, "https://www.staples.com/paper/product_555", "Paper, 5000 Sheets", 6000).await;
+        let walmart = matched(&app, user, id, "walmart", "W1", 500, "found").await;
+        let row_id: i64 =
+            sqlx::query_scalar("SELECT id FROM comparisons WHERE product_id = ?").bind(walmart).fetch_one(&app.db).await.unwrap();
+        // Without the amounts it looks twelve times cheaper, which was announced.
+        assert_eq!(alert_titles(&app, user).await, vec!["Walmart: $5.00 here, $60.00 at Staples"]);
+
+        set_pack(&app.db, row_id, &PackDiff { source_qty: 5000.0, other_qty: 500.0, unit: "sheets".into() }).await.unwrap();
+        sqlx::query("UPDATE comparisons SET last_notified_cents = NULL").execute(&app.db).await.unwrap();
+        check_cheaper(&app, user, id).await.unwrap();
+        let alert = db::notifications(&app.db, user, 0, 50).await.unwrap().remove(0);
+        assert_eq!(alert.title, "Walmart: $50.00 for 5000 sheets, $60.00 at Staples");
+        assert!(alert.body.contains("sold there as 500 sheets for $5.00"), "{}", alert.body);
+        let best = best_elsewhere(&app.db, user).await.unwrap();
+        assert_eq!(best[&id].cents, 5000);
+
+        // At $7 a ream it is dearer for the same amount: no longer the best, nothing announced.
+        let obs = Observation { price_cents: Some(700), ..Default::default() };
+        db::record_observation(&app.db, walmart, &obs, "server", Audience::Public, None, Some(60)).await.unwrap();
+        let before = alert_titles(&app, user).await.len();
+        price_changed(&app, walmart).await.unwrap();
+        assert_eq!(alert_titles(&app, user).await.len(), before);
+        assert_eq!(best_elsewhere(&app.db, user).await.unwrap()[&id].cents, 7000);
+    }
+
+    #[tokio::test]
+    async fn delivery_and_marketplace_sellers_count_when_comparing() {
+        let app = test_app().await;
+        let user = db::create_user(&app.db, "sam", "h", true).await.unwrap();
+        let id = tracked(&app, user, "https://www.staples.com/chair/product_555", "Chair", 10000).await;
+
+        // $90 at Amazon from another seller, plus $15 delivery: dearer than $100 in all.
+        let amazon = matched(&app, user, id, "amazon", "B1", 9000, "found").await;
+        let offer = Observation {
+            price_cents: Some(9000),
+            seller: Some("Chairs R Us".into()),
+            third_party: Some(true),
+            store_ships: Some(false),
+            ships_free: Some(false),
+            shipping_cents: Some(1500),
+            ..Default::default()
+        };
+        sqlx::query("DELETE FROM notifications").execute(&app.db).await.unwrap();
+        sqlx::query("UPDATE comparisons SET last_notified_cents = NULL").execute(&app.db).await.unwrap();
+        db::record_observation(&app.db, amazon, &offer, "server", Audience::Public, None, Some(60)).await.unwrap();
+        price_changed(&app, amazon).await.unwrap();
+        assert!(alert_titles(&app, user).await.is_empty(), "$90 + $15 delivery is not cheaper than $100");
+        assert!(best_elsewhere(&app.db, user).await.unwrap().get(&id).is_some_and(|b| b.cents == 10500));
+
+        // It drops to $70: cheaper even with delivery, and the alert says who sells it.
+        let offer = Observation { price_cents: Some(7000), ..offer };
+        db::record_observation(&app.db, amazon, &offer, "server", Audience::Public, None, Some(60)).await.unwrap();
+        price_changed(&app, amazon).await.unwrap();
+        let alert = db::notifications(&app.db, user, 0, 50).await.unwrap().remove(0);
+        assert_eq!(alert.title, "Amazon: $85.00 here, $100.00 at Staples");
+        assert!(alert.body.contains("includes $15.00 for delivery"), "{}", alert.body);
+        assert!(alert.body.contains("Sold by Chairs R Us, a marketplace seller"), "{}", alert.body);
+
+        // A membership does not cover what the seller ships itself.
+        db::add_terms(&app.db, user, "amazon", "Prime", 0.0, "", "", true).await.unwrap();
+        assert_eq!(best_elsewhere(&app.db, user).await.unwrap()[&id].cents, 8500);
+        // Once Amazon ships it, the membership makes delivery free.
+        sqlx::query("UPDATE products SET store_ships = 1 WHERE id = ?").bind(amazon).execute(&app.db).await.unwrap();
+        assert_eq!(best_elsewhere(&app.db, user).await.unwrap()[&id].cents, 7000);
+
+        // Choosing to leave marketplace sellers out removes the offer from comparisons.
+        sqlx::query("UPDATE user_settings SET ignore_marketplace = 1 WHERE user_id = ?")
+            .bind(user)
+            .execute(&app.db)
+            .await
+            .unwrap();
+        assert!(!best_elsewhere(&app.db, user).await.unwrap().contains_key(&id));
     }
 
     #[tokio::test]

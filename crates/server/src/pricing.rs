@@ -69,11 +69,24 @@ pub struct PriceView {
     /// Name and percent of the personal discount applied.
     pub discount_name: Option<String>,
     pub discount_percent: Option<f64>,
-    /// What this person would actually pay.
+    /// What this person would actually pay for the item itself.
     pub your_cents: Option<i64>,
+    /// What delivery adds for this person: 0 when it is free or a membership
+    /// covers it. None when the page does not say.
+    pub shipping_cents: Option<i64>,
+    /// Delivery is charged, but the page does not say how much.
+    pub shipping_extra: bool,
+    /// The membership that makes delivery free, when one applies.
+    pub shipping_membership: Option<String>,
 }
 
 impl PriceView {
+    /// The item and its delivery together. An unknown delivery charge counts
+    /// as nothing, so this is never less than the real cost.
+    pub fn total_cents(&self) -> Option<i64> {
+        self.your_cents.map(|cents| cents + self.shipping_cents.unwrap_or(0))
+    }
+
     /// True when the personal price is lower than the public one.
     pub fn is_personal(&self) -> bool {
         matches!((self.your_cents, self.public_cents), (Some(y), Some(p)) if y < p)
@@ -88,12 +101,28 @@ pub fn view(product: &Product, member_cents: Option<i64>, rules: &[DiscountRule]
         (p, m) => p.or(m),
     };
     let rule = best_rule(rules, product);
+    // A membership covers delivery of what the store ships itself.
+    let membership = rules
+        .iter()
+        .find(|r| r.enabled && r.free_shipping && r.retailer == product.retailer)
+        .filter(|_| product.store_ships != Some(false));
+    let (shipping_cents, shipping_extra) = match (membership, product.ships_free, product.shipping_cents) {
+        (Some(_), _, _) => (Some(0), false),
+        (None, _, Some(charge)) if charge > 0 => (Some(charge), false),
+        (None, Some(true), _) => (Some(0), false),
+        (None, Some(false), _) => (None, true),
+        (None, None, _) => (None, false),
+    };
     PriceView {
         public_cents: public,
         member_cents,
         discount_name: rule.map(|r| r.name.clone()),
         discount_percent: rule.map(|r| r.percent),
         your_cents: base.map(|b| rule.map_or(b, |r| apply_percent(b, r.percent))),
+        shipping_cents,
+        shipping_extra,
+        // Only worth naming when it changes something.
+        shipping_membership: membership.filter(|_| product.ships_free != Some(true)).map(|r| r.name.clone()),
     }
 }
 
@@ -191,6 +220,11 @@ mod tests {
             fail_count: 0,
             last_error: None,
             details: None,
+            seller: None,
+            third_party: None,
+            store_ships: None,
+            ships_free: None,
+            shipping_cents: None,
         }
     }
 
@@ -205,6 +239,7 @@ mod tests {
             exclude_keywords: exclude.into(),
             enabled: true,
             created_at: 0,
+            free_shipping: false,
         }
     }
 
@@ -257,6 +292,43 @@ mod tests {
         assert!(v.is_personal());
         // A stale, higher signed-in price never makes things worse than public.
         assert_eq!(view(&p, Some(25000), &[]).your_cents, Some(20000));
+    }
+
+    #[test]
+    fn delivery_is_counted_unless_a_membership_covers_it() {
+        let mut p = product("amazon", "Cable", None, 1000);
+        // The page says nothing: nothing is assumed.
+        let v = view(&p, None, &[]);
+        assert_eq!((v.shipping_cents, v.shipping_extra, v.total_cents()), (None, false, Some(1000)));
+
+        p.ships_free = Some(false);
+        p.shipping_cents = Some(599);
+        let v = view(&p, None, &[]);
+        assert_eq!((v.your_cents, v.shipping_cents, v.total_cents()), (Some(1000), Some(599), Some(1599)));
+
+        // Charged, amount unknown: flagged rather than guessed.
+        p.shipping_cents = None;
+        let v = view(&p, None, &[]);
+        assert_eq!((v.shipping_cents, v.shipping_extra, v.total_cents()), (None, true, Some(1000)));
+
+        // A membership makes delivery free, here and only here.
+        let prime = DiscountRule { free_shipping: true, ..rule("amazon", "Prime", 0.0, "", "") };
+        let v = view(&p, None, std::slice::from_ref(&prime));
+        assert_eq!((v.your_cents, v.shipping_cents, v.shipping_extra), (Some(1000), Some(0), false));
+        assert_eq!(v.shipping_membership.as_deref(), Some("Prime"));
+        assert_eq!(v.discount_name, None, "a membership alone takes nothing off the price");
+        let elsewhere = product("walmart", "Cable", None, 1000);
+        assert_eq!(view(&elsewhere, None, std::slice::from_ref(&prime)).shipping_membership, None);
+
+        // But not for something the seller ships itself.
+        p.store_ships = Some(false);
+        assert!(view(&p, None, std::slice::from_ref(&prime)).shipping_extra);
+
+        // Free anyway: the membership is not what makes it free.
+        p.store_ships = Some(true);
+        p.ships_free = Some(true);
+        let v = view(&p, None, &[prime]);
+        assert_eq!((v.shipping_cents, v.shipping_membership), (Some(0), None));
     }
 
     #[test]

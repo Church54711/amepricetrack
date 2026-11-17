@@ -3,7 +3,7 @@
 //! product. The rules in `matching` stay in charge of anything a barcode or
 //! model number settles; the AI is asked about the rest.
 
-use super::matching::Facts;
+use super::matching::{Facts, PackDiff};
 use super::search::Candidate;
 use crate::ai::{self, AiConfig, Options};
 use crate::pricing::dollars;
@@ -20,8 +20,9 @@ pub struct Advisor {
 /// The AI's answer about a handful of listings from one store.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Judgement {
-    /// Listing `index` is the same product.
-    Same { index: usize, why: String },
+    /// Listing `index` is the same product. `pack` is set when it is the same
+    /// item sold in a different amount.
+    Same { index: usize, why: String, pack: Option<PackDiff> },
     /// None of the listings is the same product.
     Different { why: String },
     /// It could not tell. `index` is the listing it leaned towards, if any.
@@ -44,10 +45,14 @@ You decide whether a listing at another store is the same product a shopper is t
 compared fairly. A wrong \"same\" sends the shopper a false price alert, so it is the costlier mistake: say it only \
 when the details support it.
 
-It is the same only if buying either one gives the shopper the same thing: the same brand, model or edition, \
-generation, size or capacity, colour, and pack count. These are not the same: an accessory or part for the product; \
-a different generation or model; a bundle with extras; a multi-pack against a single item, or packs of different \
-sizes; a different colour.
+It is the same only if buying either one gives the shopper the same item: the same brand, model or edition, \
+generation, size or capacity, and colour. These are not the same: an accessory or part for the product; a different \
+generation or model; a bundle with extras; a different colour; a different size of the item itself (a 12 oz bottle \
+against a 24 oz one); a used, refurbished or renewed one against a new one.
+
+The same item sold in a different quantity still counts as a match, because the tracker then compares the price per \
+item: a 3-pack against a single one, a ream of paper against a carton of the same paper. Report the quantities so it \
+can do that.
 
 Product lines such as collectible figures, toys, clothing and cosmetics have many near-identical variants. When one \
 name carries a variant, edition, character detail or item number that the other does not (\"with Bags\", \"Easter\", \
@@ -60,11 +65,14 @@ quantity or item, but is not proof on its own.
 
 You are given the tracked product and one or more numbered listings from the other store. Reply with JSON only, in \
 this shape: {\"differences\": \"Listing 1 adds shopping bags; listing 2 none\", \"match\": 2, \"sure\": true, \
-\"why\": \"Same model and colour\"}
+\"why\": \"Same model and colour\", \"tracked_count\": 1, \"listing_count\": 1}
 - differences: for each listing, what sets it apart from the tracked product, or \"none\". Work this out first.
 - match: the number of the listing that is the same product, or 0 if none of them is.
 - sure: false when the details given are not enough to tell.
-- why: the deciding fact, in at most twelve words.";
+- why: the deciding fact, in at most twelve words.
+- tracked_count and listing_count: how many of the item one purchase holds, for the tracked product and for the \
+matched listing. Both 1 when neither is a multi-pack. Use the same unit for both (items, sheets, rolls). When the \
+two hold different amounts and you cannot tell how many, you are not sure.";
 
 fn describe(f: &Facts) -> String {
     let mut lines = vec![format!("name: {}", f.title)];
@@ -114,10 +122,22 @@ fn parse_judgement(answer: &str, count: usize) -> Option<Judgement> {
     let sure = value.get("sure").and_then(Value::as_bool).unwrap_or(false);
     let why: String =
         value.get("why").and_then(Value::as_str).unwrap_or("").trim().trim_end_matches('.').chars().take(90).collect();
+    // How many each purchase holds. Left out, or the same, means one for one.
+    let count = |key: &str| value.get(key).and_then(Value::as_f64).filter(|n| n.is_finite());
+    let pack = match (count("tracked_count"), count("listing_count")) {
+        (Some(tracked), Some(listing)) if tracked != listing => {
+            // Different amounts that are not both stated cannot be compared.
+            if tracked <= 0.0 || listing <= 0.0 {
+                return Some(Judgement::Unsure { index: chosen.checked_sub(1) });
+            }
+            Some(PackDiff { source_qty: tracked, other_qty: listing, unit: "count".into() })
+        }
+        _ => None,
+    };
     Some(match (chosen, sure) {
         (0, true) => Judgement::Different { why },
         (0, false) => Judgement::Unsure { index: None },
-        (n, true) => Judgement::Same { index: n - 1, why },
+        (n, true) => Judgement::Same { index: n - 1, why, pack },
         (n, false) => Judgement::Unsure { index: Some(n - 1) },
     })
 }
@@ -171,9 +191,11 @@ impl Advisor {
                 "differences": { "type": "string" },
                 "match": { "type": "integer" },
                 "sure": { "type": "boolean" },
-                "why": { "type": "string" }
+                "why": { "type": "string" },
+                "tracked_count": { "type": "number" },
+                "listing_count": { "type": "number" }
             },
-            "required": ["differences", "match", "sure", "why"],
+            "required": ["differences", "match", "sure", "why", "tracked_count", "listing_count"],
             "additionalProperties": false
         });
         let answer = self.ask(JUDGE_SYSTEM, question, schema, false).await?;
@@ -203,7 +225,25 @@ mod tests {
     fn reads_the_judgement() {
         assert_eq!(
             parse_judgement(r#"{"match": 2, "sure": true, "why": "Same model and colour."}"#, 3),
-            Some(Judgement::Same { index: 1, why: "Same model and colour".into() })
+            Some(Judgement::Same { index: 1, why: "Same model and colour".into(), pack: None })
+        );
+        // The same item in another amount is a match that carries the amounts.
+        assert_eq!(
+            parse_judgement(r#"{"match": 1, "sure": true, "why": "Same pens", "tracked_count": 12, "listing_count": 36}"#, 1),
+            Some(Judgement::Same {
+                index: 0,
+                why: "Same pens".into(),
+                pack: Some(PackDiff { source_qty: 12.0, other_qty: 36.0, unit: "count".into() })
+            })
+        );
+        assert_eq!(
+            parse_judgement(r#"{"match": 1, "sure": true, "why": "Same pens", "tracked_count": 1, "listing_count": 1}"#, 1),
+            Some(Judgement::Same { index: 0, why: "Same pens".into(), pack: None })
+        );
+        // Different amounts it could not count: no fair comparison, so not sure.
+        assert_eq!(
+            parse_judgement(r#"{"match": 1, "sure": true, "why": "Same pens", "tracked_count": 1, "listing_count": 0}"#, 1),
+            Some(Judgement::Unsure { index: Some(0) })
         );
         assert_eq!(
             parse_judgement(r#"{"match": 0, "sure": true, "why": "A three-pack"}"#, 1),
@@ -245,7 +285,7 @@ mod tests {
 
         let (address, asked) = canned(r#"{"match": 1, "sure": true, "why": "Same headphones, same colour"}"#).await;
         let judgement = advisor(address).judge(&source, "Walmart", &[listing]).await;
-        assert_eq!(judgement, Some(Judgement::Same { index: 0, why: "Same headphones, same colour".into() }));
+        assert_eq!(judgement, Some(Judgement::Same { index: 0, why: "Same headphones, same colour".into(), pack: None }));
         let question = asked.lock().unwrap()[0]["messages"][0]["content"].as_str().unwrap().to_string();
         assert!(question.contains("The tracked product\nname: AirPods Max 2 Blue\nbrand: Apple"), "{question}");
         assert!(

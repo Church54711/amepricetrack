@@ -33,6 +33,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -46,6 +49,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -53,6 +57,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.amepricetrack.App
 import app.amepricetrack.data.Alert
 import app.amepricetrack.work.AlertWorker
+import app.amepricetrack.work.ReportWorker
 import kotlinx.coroutines.launch
 
 // ------------------------------------------------------------------ alerts
@@ -226,6 +231,13 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
     val session by app.session.state.collectAsStateWithLifecycle()
     var canNotify by remember { mutableStateOf(AlertWorker.canNotify(app)) }
     var message by remember { mutableStateOf<String?>(null) }
+    var autoReport by remember { mutableStateOf(app.session.autoReport) }
+    // What the last automatic report did; read again whenever the app comes back to the front.
+    var lastReport by remember { mutableStateOf<String?>(null) }
+    LifecycleResumeEffect(Unit) {
+        lastReport = app.session.lastReportSummary?.let { "Last time, ${ago(app.session.lastReportAt / 1000)}: $it" }
+        onPauseOrDispose {}
+    }
     val scope = rememberCoroutineScope()
     val askPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         canNotify = AlertWorker.canNotify(app)
@@ -248,6 +260,7 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
                     // Tell the server to forget this device; sign out here either way.
                     app.attempt { app.api.logout() }
                     AlertWorker.cancel(app)
+                    ReportWorker.cancel(app)
                     app.session.signOut()
                 }
             }) { Text("Sign out") }
@@ -276,6 +289,33 @@ fun SettingsScreen(app: App, onOpenPhone: () -> Unit) {
                     "member and employee prices, your own Walmart store, and stores your server cannot read.",
             )
             Button(onClick = onOpenPhone) { Text("Open") }
+
+            Text("Report by itself", fontWeight = FontWeight.Medium)
+            val choices = listOf("off" to "Off", "daily" to "Daily", "twice" to "Twice a day")
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                choices.forEachIndexed { index, (mode, label) ->
+                    SegmentedButton(
+                        selected = autoReport == mode,
+                        onClick = {
+                            autoReport = mode
+                            app.session.autoReport = mode
+                            ReportWorker.schedule(app, mode)
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index, choices.size),
+                        // No tick: the three labels need the room on a narrow phone.
+                        icon = {},
+                    ) { Text(label, maxLines = 1) }
+                }
+            }
+            Muted(
+                if (autoReport == "off") {
+                    "The phone only reports prices when you open the screen above and start it."
+                } else {
+                    "In the background, the phone reads the products your server cannot read itself, and the ones at stores you " +
+                        "opened in the app, and sends those prices to your server." +
+                        (lastReport?.let { " $it" } ?: "")
+                },
+            )
         }
 
         Card {

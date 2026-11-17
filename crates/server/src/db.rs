@@ -78,6 +78,16 @@ pub struct Product {
     pub last_error: Option<String>,
     /// Colour, size and a line of description from the product page.
     pub details: Option<String>,
+    /// Who sells it, at stores that host other sellers.
+    pub seller: Option<String>,
+    /// True when that seller is not the store itself.
+    pub third_party: Option<bool>,
+    /// True when the store itself ships it, whoever sells it.
+    pub store_ships: Option<bool>,
+    /// True when delivery is free, false when it is charged.
+    pub ships_free: Option<bool>,
+    /// The delivery charge, when the page states one.
+    pub shipping_cents: Option<i64>,
 }
 
 impl Product {
@@ -117,6 +127,8 @@ pub struct DiscountRule {
     pub exclude_keywords: String,
     pub enabled: bool,
     pub created_at: i64,
+    /// A membership that makes delivery free at this store.
+    pub free_shipping: bool,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -161,6 +173,8 @@ pub struct Settings {
     pub auto_compare: bool,
     /// AI model for matching products across stores; empty to use `ai_model`.
     pub ai_match_model: String,
+    /// Leave marketplace sellers' offers out when comparing stores.
+    pub ignore_marketplace: bool,
 }
 
 /// A store someone added to this server.
@@ -380,6 +394,11 @@ pub async fn record_observation(
         sqlx::query(
             "UPDATE products SET current_price_cents = ?, list_price_cents = ?, promo_text = ?,
                 in_stock = COALESCE(?, in_stock),
+                -- Who sells and ships it belongs to this price; a reading that does not say keeps what was known.
+                seller = COALESCE(?, seller), third_party = COALESCE(?, third_party),
+                store_ships = COALESCE(?, store_ships),
+                ships_free = CASE WHEN ? THEN ? ELSE ships_free END,
+                shipping_cents = CASE WHEN ? THEN ? ELSE shipping_cents END,
                 lowest_price_cents = CASE WHEN ? THEN ? ELSE lowest_price_cents END,
                 lowest_price_at = CASE WHEN ? THEN ? ELSE lowest_price_at END
              WHERE id = ?",
@@ -388,6 +407,13 @@ pub async fn record_observation(
         .bind(obs.list_price_cents)
         .bind(&obs.promo_text)
         .bind(obs.in_stock)
+        .bind(&obs.seller)
+        .bind(obs.third_party)
+        .bind(obs.store_ships)
+        .bind(obs.ships_free.is_some())
+        .bind(obs.ships_free)
+        .bind(obs.ships_free.is_some())
+        .bind(obs.shipping_cents)
         .bind(new_low)
         .bind(price)
         .bind(new_low)
@@ -655,9 +681,24 @@ pub async fn add_rule(
     brands: &str,
     exclude_keywords: &str,
 ) -> Result<i64> {
+    add_terms(db, user_id, retailer, name, percent, brands, exclude_keywords, false).await
+}
+
+/// Adds a person's own terms at a store: a discount, free delivery, or both.
+#[allow(clippy::too_many_arguments)]
+pub async fn add_terms(
+    db: &Db,
+    user_id: i64,
+    retailer: &str,
+    name: &str,
+    percent: f64,
+    brands: &str,
+    exclude_keywords: &str,
+    free_shipping: bool,
+) -> Result<i64> {
     Ok(sqlx::query(
-        "INSERT INTO discount_rules (user_id, retailer, name, percent, brands, exclude_keywords, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO discount_rules (user_id, retailer, name, percent, brands, exclude_keywords, created_at, free_shipping)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(user_id)
     .bind(retailer)
@@ -666,6 +707,7 @@ pub async fn add_rule(
     .bind(brands)
     .bind(exclude_keywords)
     .bind(now())
+    .bind(free_shipping)
     .execute(db)
     .await?
     .last_insert_rowid())
